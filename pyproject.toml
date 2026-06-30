@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "sctools"
+version = "0.1.0"
+description = "Single-cell RNA-seq analysis utilities"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Tahila Andrighetti", email = "tahilaandrighetti@gmail.com" },
+]
+requires-python = ">=3.10"
+dependencies = [
+    "anndata",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "scanpy",
+    "scipy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sctools*"]
