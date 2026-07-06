@@ -9,6 +9,8 @@ except PackageNotFoundError:
 
 from sctools.plots import PlotHeatmap
 from sctools.io import CatAdata
+from sctools.preprocessing import NormalizeHvgPcaKnn
+from sctools.alra import RunAlraOnAnnData
 
 from sctools.qc import (
     # Ambient RNA
@@ -36,6 +38,10 @@ __all__ = [
     "CatAdata",
     # Generic plots
     "PlotHeatmap",
+    # Preprocessing
+    "NormalizeHvgPcaKnn",
+    # Imputation
+    "RunAlraOnAnnData",
     # Ambient RNA
     "AmbientRNA",
     # Doublets
