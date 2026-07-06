@@ -73,6 +73,21 @@ pip install -e .
 |---|---|
 | `RunAlraOnAnnData` | Run the official R `ALRA` package (`choose_k()` + `alra()`) via rpy2 |
 
+### `sctools.integration` — Batch integration, clustering, benchmarking
+
+| Function | Description |
+|---|---|
+| `RunSeuratAnchors` | Seurat CCA anchor integration (via rpy2/R) |
+| `PlotUmap` | Save a UMAP plot to disk for a given representation |
+| `ApplyIntegrationMethods` | Apply BBKNN / Seurat / Scanorama / Harmony / scVI, return one AnnData per method |
+| `Clustering` | Leiden clustering at multiple resolutions + UMAP plots |
+| `RunIntegrationComplete` | Full single-method pipeline: `NormalizeHvgPcaKnn` -> integration -> clustering |
+| `AttachHvgResultsToFullAdata` | Attach HVG-based embeddings/clusters back onto the full (all-genes) AnnData |
+| `UpdateCellsToRemove` | Log + accumulate low-quality clusters to remove across iterative curation passes |
+| `RunScibMetricsWithLeiden` | scIB metrics (PCR_batch, iLISI, hvg_score, cell_cycle, silhouette) using Leiden as proxy labels |
+| `BuildCombinationsDictAndParamsDf` | Build a flavor x n_top_genes x n_pcs grid for benchmarking |
+| `RunIntegrationTests` | Run the full grid: preprocess, integrate, score each combination with scIB |
+
 ## Typical QC workflow
 
 ```python
@@ -133,6 +148,52 @@ from sctools.alra import RunAlraOnAnnData
 
 # 9. Impute dropouts for exploratory marker visualization (not for DE)
 adata = RunAlraOnAnnData(adata, input_layer="QC_filtered_log1p", output_layer="alra")
+```
+
+## Typical integration workflow (single method, production run)
+
+```python
+from sctools.integration import RunIntegrationComplete, AttachHvgResultsToFullAdata
+
+# 10. Preprocess + integrate with one method + Leiden-cluster the result
+adata_run, adata_cl_hvg = RunIntegrationComplete(
+    adata, method="harmony", out_dir="plots/umaps",
+    flavor="cell_ranger", n_top_genes=1000, n_pcs=20, n_neighbors=15,
+)
+
+# 11. Carry the HVG-based embeddings/clusters back onto the full-gene object
+adata_full = AttachHvgResultsToFullAdata(adata_run, adata_cl_hvg, method="harmony")
+```
+
+## Typical integration benchmarking workflow (grid search + scIB metrics)
+
+```python
+from sctools.integration import (
+    BuildCombinationsDictAndParamsDf, RunIntegrationTests,
+)
+
+# 12. Build a flavor x n_top_genes x n_pcs grid
+config = {
+    "flavors": ("seurat", "seurat_v3", "cell_ranger"),
+    "n_top_genes_list": (1000, 2000, 3000),
+    "n_pcs_list": (20, 35, 50),
+}
+combinations_dict, params_df = BuildCombinationsDictAndParamsDf(config)
+
+# 13. Run every combination through every integration method and score with scIB
+# organism is required explicitly ("human" or "mouse") -- it is NOT inferred.
+all_metrics_df, params_df = RunIntegrationTests(
+    adata=adata,
+    combinations_dict=combinations_dict,
+    out_dir="results/benchmark",
+    versao="04.1sx.scNeuAntib",
+    batch_key="sample",
+    input_layer="QC_filtered",
+    counts_layer="counts",
+    log_layer="QC_filtered_log1p",
+    organism="mouse",
+    methods=["seurat", "harmony", "scanorama", "bbknn", "scvi"],
+)
 ```
 
 ## Requirements

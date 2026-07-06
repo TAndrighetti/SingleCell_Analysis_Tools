@@ -12,6 +12,19 @@ from sctools.io import CatAdata
 from sctools.preprocessing import NormalizeHvgPcaKnn
 from sctools.alra import RunAlraOnAnnData
 
+from sctools.integration import (
+    RunSeuratAnchors,
+    PlotUmap,
+    ApplyIntegrationMethods,
+    Clustering,
+    RunIntegrationComplete,
+    AttachHvgResultsToFullAdata,
+    UpdateCellsToRemove,
+    RunScibMetricsWithLeiden,
+    BuildCombinationsDictAndParamsDf,
+    RunIntegrationTests,
+)
+
 from sctools.qc import (
     # Ambient RNA
     AmbientRNA,
@@ -42,6 +55,17 @@ __all__ = [
     "NormalizeHvgPcaKnn",
     # Imputation
     "RunAlraOnAnnData",
+    # Integration
+    "RunSeuratAnchors",
+    "PlotUmap",
+    "ApplyIntegrationMethods",
+    "Clustering",
+    "RunIntegrationComplete",
+    "AttachHvgResultsToFullAdata",
+    "UpdateCellsToRemove",
+    "RunScibMetricsWithLeiden",
+    "BuildCombinationsDictAndParamsDf",
+    "RunIntegrationTests",
     # Ambient RNA
     "AmbientRNA",
     # Doublets
