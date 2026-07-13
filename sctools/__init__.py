@@ -9,20 +9,32 @@ except PackageNotFoundError:
 
 from sctools.plots import PlotHeatmap
 from sctools.io import CatAdata
-from sctools.preprocessing import NormalizeHvgPcaKnn
+from sctools.preprocessing import (
+    NormalizeHvgPcaKnn,
+    CheckNormalizedLayer,
+    NormalizeLog1pFromLayer,
+    RunHighlyVariableGenes,
+    RunPcaOnHvgs,
+    RunNeighborsAndUmap,
+)
 from sctools.alra import RunAlraOnAnnData
 
 from sctools.integration import (
     RunSeuratAnchors,
     PlotUmap,
-    ApplyIntegrationMethods,
-    Clustering,
     RunIntegrationComplete,
     AttachHvgResultsToFullAdata,
     UpdateCellsToRemove,
-    RunScibMetricsWithLeiden,
-    BuildCombinationsDictAndParamsDf,
-    RunIntegrationTests,
+    RunScibMetricsWithLabel,
+    RunScibMetricsLabelFree,
+    BuildBenchmarkGrid,
+    RunIntegrationBenchmark,
+    SummarizeScibBenchmarkResults,
+    RunHarmonyIntegration,
+    RunScanoramaIntegration,
+    RunScviIntegration,
+    RunSeuratAnchorsIntegration,
+    RunLeidenClustering,
 )
 
 from sctools.qc import (
@@ -53,19 +65,29 @@ __all__ = [
     "PlotHeatmap",
     # Preprocessing
     "NormalizeHvgPcaKnn",
+    "CheckNormalizedLayer",
+    "NormalizeLog1pFromLayer",
+    "RunHighlyVariableGenes",
+    "RunPcaOnHvgs",
+    "RunNeighborsAndUmap",
     # Imputation
     "RunAlraOnAnnData",
     # Integration
     "RunSeuratAnchors",
     "PlotUmap",
-    "ApplyIntegrationMethods",
-    "Clustering",
     "RunIntegrationComplete",
     "AttachHvgResultsToFullAdata",
     "UpdateCellsToRemove",
-    "RunScibMetricsWithLeiden",
-    "BuildCombinationsDictAndParamsDf",
-    "RunIntegrationTests",
+    "RunScibMetricsWithLabel",
+    "RunScibMetricsLabelFree",
+    "BuildBenchmarkGrid",
+    "RunIntegrationBenchmark",
+    "SummarizeScibBenchmarkResults",
+    "RunHarmonyIntegration",
+    "RunScanoramaIntegration",
+    "RunScviIntegration",
+    "RunSeuratAnchorsIntegration",
+    "RunLeidenClustering",
     # Ambient RNA
     "AmbientRNA",
     # Doublets

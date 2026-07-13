@@ -1,0 +1,10 @@
+anndata
+matplotlib
+numpy
+pandas
+scanpy
+scipy
+
+[dev]
+pytest
+pytest-cov

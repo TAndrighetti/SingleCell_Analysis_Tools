@@ -12,7 +12,6 @@ Reusable steps:
     CheckNormalizedLayer()
     NormalizeLog1pFromLayer()
     RunHighlyVariableGenes()
-    ResolveNPcs()
     RunPcaOnHvgs()
     RunNeighborsAndUmap()
 """
@@ -26,6 +25,10 @@ import numpy as np
 import scanpy as sc
 from anndata import AnnData
 from scipy.sparse import issparse
+
+
+from typing import Literal
+
 
 logger = logging.getLogger(__name__)
 
@@ -51,18 +54,6 @@ def CheckNormalizedLayer(X) -> None:
                 "Input contains negative values. "
                 "Use a normalized/log-transformed layer, not scaled data."
             )
-
-
-def SetRandomSeed(random_state: int) -> None:
-    """
-    Set Python and NumPy random seeds for reproducibility.
-
-    This changes the global random state. In general-purpose libraries this is
-    often avoided, but here it is intentionally kept because the pipeline is
-    expected to be reproducible across notebook runs.
-    """
-    np.random.seed(random_state)
-    random.seed(random_state)
 
 
 def NormalizeLog1pFromLayer(
@@ -127,192 +118,161 @@ def NormalizeLog1pFromLayer(
     return output_layer
 
 
+
 def RunHighlyVariableGenes(
     adata: AnnData,
     *,
-    input_layer: str,
+    layer: str | None = None,
     batch_key: str | None = None,
     n_top_genes: int = 2000,
-    flavor: str = "cell_ranger",
+    flavor: Literal[
+        "seurat",
+        "cell_ranger",
+        "seurat_v3",
+        "seurat_v3_paper",
+    ] = "cell_ranger",
     check_integer_counts: bool = True,
 ) -> None:
     """
-    Select highly variable genes.
+    Select highly variable genes and store the result in `adata.var`.
 
-    For `flavor="seurat"` and `flavor="cell_ranger"`, Scanpy expects
-    normalized + log1p values, so HVGs are computed from `.X`.
+    Data expectations
+    -----------------
+    - flavor="seurat" or "cell_ranger":
+        expects normalized + log1p expression values.
 
-    For `flavor="seurat_v3"`, Scanpy expects count-scale data, so HVGs are
-    computed from `adata.layers[input_layer]`.
+    - flavor="seurat_v3" or "seurat_v3_paper":
+        expects count-scale data, preferably raw integer UMI counts.
 
     Parameters
     ----------
-    input_layer
-        Count layer used only when `flavor="seurat_v3"`.
+    adata
+        AnnData object.
+
+    layer
+        Layer to use as input. If None, uses `adata.X`.
+
+        For "seurat" and "cell_ranger", this should contain normalized + log1p data.
+        For "seurat_v3" and "seurat_v3_paper", this should contain count-scale data.
 
     batch_key
-        Optional batch/sample column in `adata.obs`.
-        Use technical/sample-level variables such as "sample", "library",
-        "run", or "batch". Avoid using biological variables such as condition
-        or genotype unless this is intentional.
+        Optional column in `adata.obs` used to select HVGs within batches and then merge.
+        Prefer technical/sample-level variables such as sample, library, run, or batch.
+        Avoid condition/genotype unless this is intentional.
 
     n_top_genes
-        Number of HVGs to select.
+        Number of highly variable genes to select.
 
     flavor
         HVG method passed to Scanpy.
 
     check_integer_counts
-        Passed to Scanpy when `flavor="seurat_v3"`.
-        If the layer is not integer-like, Scanpy may warn.
+        Passed to Scanpy for "seurat_v3" and "seurat_v3_paper".
     """
+    allowed_flavors = {
+        "seurat",
+        "cell_ranger",
+        "seurat_v3",
+        "seurat_v3_paper",
+    }
+
+    if flavor not in allowed_flavors:
+        raise ValueError(
+            f"Invalid flavor '{flavor}'. "
+            f"Expected one of: {sorted(allowed_flavors)}."
+        )
+
+    if n_top_genes <= 0:
+        raise ValueError("n_top_genes must be a positive integer.")
+
+    if layer is not None and layer not in adata.layers:
+        raise KeyError(
+            f"Layer '{layer}' not found. "
+            f"Available layers: {list(adata.layers.keys())}."
+        )
+
     if batch_key is not None and batch_key not in adata.obs:
         raise KeyError(f"batch_key '{batch_key}' not found in adata.obs.")
 
     hvg_kwargs = {
+        "layer": layer,
         "n_top_genes": n_top_genes,
         "flavor": flavor,
+        "batch_key": batch_key,
+        "subset": False,
+        "inplace": True,
     }
 
-    if batch_key is not None:
-        hvg_kwargs["batch_key"] = batch_key
-
-    if flavor == "seurat_v3":
-        if input_layer not in adata.layers:
-            raise KeyError(
-                f"Layer '{input_layer}' not found. "
-                f"Available layers: {list(adata.layers.keys())}."
-            )
-
-        hvg_kwargs["layer"] = input_layer
+    if flavor in {"seurat_v3", "seurat_v3_paper"}:
         hvg_kwargs["check_values"] = check_integer_counts
 
     try:
-        sc.pp.highly_variable_genes(
-            adata,
-            **hvg_kwargs,
-        )
+        sc.pp.highly_variable_genes(adata, **hvg_kwargs)
 
     except TypeError as error:
-        # Compatibility fallback for older Scanpy versions that do not accept
-        # `check_values`.
         if "check_values" not in str(error):
             raise
 
         hvg_kwargs.pop("check_values", None)
+        sc.pp.highly_variable_genes(adata, **hvg_kwargs)
 
-        sc.pp.highly_variable_genes(
-            adata,
-            **hvg_kwargs,
-        )
-
-
-def ResolveNPcs(
-    adata: AnnData,
-    *,
-    requested_n_pcs: int,
-    use_highly_variable: bool = True,
-    auto_reduce: bool = True,
-) -> int:
-    """
-    Validate the requested number of principal components.
-
-    Why this check exists
-    ---------------------
-    Even if you request 1000 or 2000 HVGs, PCA can still fail if the number of
-    cells is small. With `svd_solver="arpack"`, the number of PCs must be
-    strictly smaller than:
-
-        min(number of cells, number of genes used for PCA)
-
-    For example:
-        - 1000 HVGs and 5000 cells -> n_pcs=35 is fine.
-        - 1000 HVGs and 20 cells   -> n_pcs=35 is not valid.
-
-    This function prevents PCA from failing in small test objects, subsets,
-    or rare edge cases after filtering.
-
-    Parameters
-    ----------
-    requested_n_pcs
-        Number of PCs requested by the user.
-
-    use_highly_variable
-        If True, checks the number of HVGs. If False, checks all genes.
-
-    auto_reduce
-        If True, reduce `requested_n_pcs` to the maximum valid value and log a
-        warning. If False, raise an error.
-
-    Returns
-    -------
-    n_pcs_used
-        Valid number of PCs to use.
-    """
-    if use_highly_variable:
-        if "highly_variable" not in adata.var:
-            raise KeyError(
-                "Missing adata.var['highly_variable']. "
-                "Run RunHighlyVariableGenes() before PCA."
-            )
-
-        n_genes_for_pca = int(adata.var["highly_variable"].sum())
-        gene_set_name = "HVGs"
-
-    else:
-        n_genes_for_pca = int(adata.n_vars)
-        gene_set_name = "genes"
-
-    if n_genes_for_pca < 2:
-        raise ValueError(
-            f"Only {n_genes_for_pca} {gene_set_name} available for PCA. "
-            "PCA requires at least 2 variables."
-        )
-
-    if adata.n_obs < 2:
-        raise ValueError(
-            f"Only {adata.n_obs} cells available for PCA. "
-            "PCA requires at least 2 cells."
-        )
-
-    max_n_pcs = min(adata.n_obs - 1, n_genes_for_pca - 1)
-
-    if requested_n_pcs <= max_n_pcs:
-        return int(requested_n_pcs)
-
-    message = (
-        f"Requested n_pcs={requested_n_pcs}, but the maximum valid value is "
-        f"{max_n_pcs} for n_obs={adata.n_obs} and "
-        f"n_{gene_set_name}={n_genes_for_pca}."
-    )
-
-    if not auto_reduce:
-        raise ValueError(message)
-
-    logger.warning("%s Using n_pcs=%d instead.", message, max_n_pcs)
-
-    return int(max_n_pcs)
 
 
 def RunPcaOnHvgs(
     adata: AnnData,
+    n_pcs: int,
     *,
-    n_pcs: int = 35,
     scale_for_pca: bool = True,
-    max_value: float | None = 10,
+    max_value: float | None = None,
     random_state: int = 42,
 ) -> str:
     """
     Compute PCA using highly variable genes.
 
-    If `scale_for_pca=True`, scaling is applied only to a temporary HVG object.
-    This keeps the original `.X` as normalized + log1p, while PCA is computed
-    from scaled log1p HVGs.
+    `adata.X` is expected to contain normalized + log1p expression.
 
-    This is useful because:
-        - `.X` remains interpretable as log-normalized expression.
-        - PCA can still benefit from scaling.
-        - the original count layer remains untouched.
+    PCA is computed on a temporary AnnData containing only HVGs, so the
+    original `adata.X` is not modified.
+
+    If `scale_for_pca=True`, HVGs are centered and scaled before PCA.
+    By default, no clipping is applied after scaling (`max_value=None`).
+
+    Results are written to:
+        adata.obsm["X_pca"]
+        adata.varm["PCs"]
+        adata.uns["pca"]
+        adata.var["used_for_pca"]
+
+    Notes on `max_value`
+    --------------------
+    `max_value` is passed to `sc.pp.scale`.
+
+    After scaling, each gene is centered to mean 0 and scaled to unit variance.
+    If `max_value` is not None, scaled values are clipped to the interval:
+
+        [-max_value, max_value]
+
+    For example, `max_value=10` means that values above 10 become 10,
+    and values below -10 become -10.
+
+    This can reduce the influence of extreme scaled expression values on PCA,
+    but it also modifies the scaled data before PCA. Therefore, the default
+    here is `max_value=None`, meaning no clipping is applied.
+
+    Notes on PCA loadings
+    ---------------------
+    PCA is computed only on HVGs. However, `adata.varm["PCs"]` is stored in
+    the full AnnData object with shape:
+
+        n_total_genes x n_pcs
+
+    HVGs receive their real PCA loadings. Non-HVGs receive zero by convention
+    because they were not included in the PCA. These zeros should be interpreted
+    as "not used for PCA", not as biological evidence of no contribution.
+
+    The genes actually used for PCA are stored in:
+
+        adata.var["used_for_pca"]
 
     Returns
     -------
@@ -325,17 +285,25 @@ def RunPcaOnHvgs(
             "Run RunHighlyVariableGenes() before RunPcaOnHvgs()."
         )
 
-    n_pcs_used = ResolveNPcs(
-        adata,
-        requested_n_pcs=n_pcs,
-        use_highly_variable=True,
-        auto_reduce=True,
+    if n_pcs <= 0:
+        raise ValueError("n_pcs must be a positive integer.")
+
+    if max_value is not None and max_value <= 0:
+        raise ValueError("max_value must be positive or None.")
+
+    hvg_mask = (
+        adata.var["highly_variable"]
+        .fillna(False)
+        .to_numpy(dtype=bool)
     )
 
-    hvg_mask = adata.var["highly_variable"].to_numpy()
+    n_hvgs = int(hvg_mask.sum())
 
-    # Work on a temporary object containing only HVGs.
-    # This avoids changing `.X` in the original AnnData when scaling is enabled.
+    if n_hvgs == 0:
+        raise ValueError("No highly variable genes found.")
+
+
+    # Use a temporary AnnData with only HVGs so the original adata.X is not modified.
     adata_hvg = adata[:, hvg_mask].copy()
 
     pca_input_state = "log1p"
@@ -343,33 +311,59 @@ def RunPcaOnHvgs(
     if scale_for_pca:
         sc.pp.scale(
             adata_hvg,
+            zero_center=True,
             max_value=max_value,
         )
         pca_input_state = "scaled_log1p"
 
-    sc.tl.pca(
+    sc.pp.pca(
         adata_hvg,
-        n_comps=n_pcs_used,
+        n_comps=n_pcs,
+        zero_center=True,
         svd_solver="arpack",
         random_state=random_state,
     )
 
-    # Copy PCA coordinates back to the full object.
     adata.obsm["X_pca"] = adata_hvg.obsm["X_pca"].copy()
-
-    # Copy PCA metadata.
     adata.uns["pca"] = adata_hvg.uns["pca"].copy()
-    adata.uns["pca"].setdefault("params", {})
-    adata.uns["pca"]["params"]["use_highly_variable"] = True
-    adata.uns["pca"]["params"]["pca_input_state"] = pca_input_state
-    adata.uns["pca"]["params"]["n_pcs_used"] = int(n_pcs_used)
 
-    # Store PCA loadings in the full object.
-    # HVGs receive their real loadings; non-HVGs receive zero loadings.
-    pcs = np.zeros((adata.n_vars, adata_hvg.varm["PCs"].shape[1]))
+    # Store which genes were actually used for PCA.
+    # This is important for interpretation: only HVGs contributed to the PCA.
+    adata.var["used_for_pca"] = hvg_mask
+
+    # Store PCA loadings in the full AnnData object.
+    #
+    # `adata_hvg.varm["PCs"]` has shape:
+    #     n_hvgs x n_pcs
+    #
+    # But `adata.varm["PCs"]` must have shape:
+    #     n_total_genes x n_pcs
+    #
+    # Therefore, HVGs receive their real loadings and non-HVGs receive zero.
+    # These zeros should be interpreted as "gene was not included in PCA",
+    # not as evidence that the gene has no biological contribution.
+    pcs = np.zeros(
+        shape=(adata.n_vars, adata_hvg.varm["PCs"].shape[1]),
+        dtype=adata_hvg.varm["PCs"].dtype,
+    )
     pcs[hvg_mask, :] = adata_hvg.varm["PCs"]
     adata.varm["PCs"] = pcs
 
+    adata.uns["pca"].setdefault("params", {})
+    adata.uns["pca"]["params"].update(
+        {
+            "use_highly_variable": True,
+            "n_pcs_used": int(n_pcs),
+            "n_hvgs_used": int(n_hvgs),
+            "pca_input_state": pca_input_state,
+            "scale_for_pca": bool(scale_for_pca),
+            "scale_max_value": max_value,
+            "non_hvg_loadings": "stored_as_zero_not_used_for_pca",
+        }
+    )
+
+    # return the state of the input data used for PCA, which is either "log1p" or "scaled_log1p"
+    # the main result of this function is the PCA results stored in adata.obsm["X_pca"], adata.varm["PCs"], and adata.uns["pca"]
     return pca_input_state
 
 
@@ -455,7 +449,6 @@ def StorePreprocessingParams(
         "random_state": int(random_state),
     }
 
-
 def NormalizeHvgPcaKnn(
     adata: AnnData,
     *,
@@ -524,8 +517,7 @@ def NormalizeHvgPcaKnn(
         Target sum for total-count normalization.
 
     n_pcs
-        Number of PCs requested. If too high for the object, it is reduced
-        safely by `ResolveNPcs`.
+        Number of PCs to compute.
 
     n_neighbors
         Number of neighbors for graph construction.
@@ -553,7 +545,8 @@ def NormalizeHvgPcaKnn(
     if copy:
         adata = adata.copy()
 
-    SetRandomSeed(random_state)
+    np.random.seed(random_state)
+    random.seed(random_state)
 
     log1p_layer = NormalizeLog1pFromLayer(
         adata,
@@ -561,9 +554,13 @@ def NormalizeHvgPcaKnn(
         target_sum=target_sum,
     )
 
+    # "seurat_v3"/"seurat_v3_paper" need raw counts; "seurat"/"cell_ranger" need
+    # the normalized + log1p layer just created above.
+    hvg_layer = input_layer if flavor in ("seurat_v3", "seurat_v3_paper") else log1p_layer
+
     RunHighlyVariableGenes(
         adata,
-        input_layer=input_layer,
+        layer=hvg_layer,
         batch_key=batch_key,
         n_top_genes=n_top_genes,
         flavor=flavor,
