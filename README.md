@@ -2,6 +2,8 @@
 
 Single-cell RNA-seq analysis utilities built on top of [Scanpy](https://scanpy.readthedocs.io/) and [AnnData](https://anndata.readthedocs.io/).
 
+> IMPORTANT: STILL IN DEVELOPMENT!
+
 ## Installation
 
 ```bash
