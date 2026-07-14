@@ -37,6 +37,17 @@ logger = logging.getLogger(__name__)
 
 TAB_SCIB_SUBDIR = "tab_scib"
 
+# Canonical scIB metric groups (Luecken et al. 2022): batch-correction vs
+# bio-conservation. Used as SummarizeScibBenchmarkResults' defaults so both
+# label-free and labeled runs (RunScibMetricsLabelFree vs RunScibMetricsWithLabel)
+# get the right metrics automatically -- each run's table only ever has the
+# columns it actually computed, and downstream filtering already drops the rest.
+BATCH_METRICS = ("PCR_batch", "iLISI", "ASW_label/batch", "graph_conn", "kBET")
+BIO_METRICS = (
+    "cell_cycle_conservation", "hvg_overlap", "NMI_cluster/label", "ARI_cluster/label",
+    "ASW_label", "isolated_label_F1", "isolated_label_silhouette", "cLISI",
+)
+
 
 def _Prefixed(name: str, out_prefix: str | None) -> str:
     """Build a filename, adding "{out_prefix}." only if out_prefix is given."""
@@ -408,9 +419,9 @@ def SummarizeScibBenchmarkResults(
     *,
     params_file: str | Path | None = None,
     run_ids: Iterable[int] | None = None,
-    selected_metrics: tuple[str, ...] = ("PCR_batch", "iLISI", "cell_cycle_conservation", "hvg_overlap"),
-    batch_metrics: tuple[str, ...] = ("PCR_batch", "iLISI"),
-    bio_metrics: tuple[str, ...] = ("cell_cycle_conservation", "hvg_overlap"),
+    selected_metrics: tuple[str, ...] | None = None,
+    batch_metrics: tuple[str, ...] = BATCH_METRICS,
+    bio_metrics: tuple[str, ...] = BIO_METRICS,
     batch_weight: float = 0.4,
     bio_weight: float = 0.6,
     save: bool = True,
@@ -419,7 +430,7 @@ def SummarizeScibBenchmarkResults(
     Combine per-run scIB metric files into one scaled, weighted ranking of
     method/parameter combinations, merged with their run parameters.
 
-    Reads `{metrics_dir}/[{out_prefix}.]scib_metrics_run_{run_id}.csv`
+    Reads `{metrics_dir}/[{out_prefix}.]scib_metrics_run{run_id}.csv`
     (tab-separated despite the `.csv` extension). If `run_ids` is None,
     discovers them by globbing instead of assuming a fixed run count.
 
@@ -428,36 +439,44 @@ def SummarizeScibBenchmarkResults(
     (results_with_meta, metrics_raw, metrics_scaled)
     """
     metrics_dir = Path(metrics_dir)
-    run_glob = _Prefixed("scib_metrics_run_*.csv", out_prefix)
+    run_glob = _Prefixed("scib_metrics_run*.csv", out_prefix)
 
     if run_ids is None:
-        # `glob` matches the files but doesn't sort them numerically (run_10
-        # would sort before run_2 as plain strings), so build a regex that
+        ## If i don't provide the run_ids that I want to summarize, I will glob the metrics_dir for all the run
+        ## files that match the pattern. The run_ids will be extracted from the filenames and sorted numerically.
+        ## This way, I can summarize all the runs that have been completed without having to specify them manually.
+        # `glob` matches the files but doesn't sort them numerically (run10
+        # would sort before run2 as plain strings), so build a regex that
         # pulls the run_id digits out of each filename -- same prefix logic as
         # `_Prefixed` (only prepend "{out_prefix}." if out_prefix was given) --
         # and use that captured number as the sort key below.
-        pattern = re.compile(rf"{re.escape(out_prefix) + '.' if out_prefix else ''}scib_metrics_run_(\d+)\.csv$")
+        pattern = re.compile(rf"{re.escape(out_prefix) + '.' if out_prefix else ''}scib_metrics_run(\d+)\.csv$")
         run_files = sorted(metrics_dir.glob(run_glob), key=lambda p: int(pattern.search(p.name).group(1)))
     else:
-        run_files = [metrics_dir / _Prefixed(f"scib_metrics_run_{run_id}.csv", out_prefix) for run_id in run_ids]
+        run_files = [metrics_dir / _Prefixed(f"scib_metrics_run{run_id}.csv", out_prefix) for run_id in run_ids]
 
     if not run_files:
         raise FileNotFoundError(f"No metrics files found matching {run_glob} in {metrics_dir}.")
 
-    # Load per-run metric tables. ASW_label/ASW_label_batch (when present --
-    # only computed by RunScibMetricsWithLabel, i.e. runs with a real
-    # label_key) are kept as-is here; they're not circular like they'd be
-    # with a Leiden-derived proxy label, so there's no reason to drop them
-    # from the raw output. `selected_metrics` below still controls what
-    # makes it into the final ranking.
+    # Load per-run metric tables
     metric_tables = []
     for path in run_files:
         df = pd.read_csv(path, sep="\t", index_col=0)
         metric_tables.append(df)
 
     # Rows = method_run combinations; columns = metrics.
+    # this table is simply the concatenation of all the individual run metrics tables, 
+    # without any normalization or scaling applied. 
     metrics_raw = pd.concat(metric_tables, axis=1).T
 
+    # None -> derive from batch_metrics + bio_metrics, so label-free and
+    # labeled runs each pick up exactly the metrics they actually computed.
+    if selected_metrics is None:
+        selected_metrics = tuple(batch_metrics) + tuple(bio_metrics)
+
+    # Keep only the metrics that both were requested (selected_metrics) and
+    # actually exist in metrics_raw (label-free vs labeled runs produce
+    # different columns), then drop any that came back all-NaN across every run.
     metrics = metrics_raw[[c for c in selected_metrics if c in metrics_raw.columns]].dropna(axis=1, how="all")
 
     # Min-max scale per column; zero-range columns become NaN instead of a
@@ -466,9 +485,17 @@ def SummarizeScibBenchmarkResults(
     col_range = (metrics.max() - col_min).replace(0, np.nan)
     metrics_scaled = (metrics - col_min) / col_range
 
+    # batch_metrics/bio_metrics are the full canonical lists; narrow each down
+    # to whichever of those columns actually survived into metrics_scaled
+    # (i.e. were computed for this run and weren't all-NaN).
     avail_batch = [c for c in batch_metrics if c in metrics_scaled.columns]
     avail_bio = [c for c in bio_metrics if c in metrics_scaled.columns]
 
+    # One row per method_run combination. batch_score/bio_score are each the
+    # row-wise mean of their already-[0,1]-scaled metrics (NaN if none are
+    # available); overall combines them with batch_weight/bio_weight (default
+    # 0.4/0.6, matching the scIB paper's batch-correction vs bio-conservation
+    # weighting).
     scores = pd.DataFrame(index=metrics_scaled.index)
     scores["batch_score"] = metrics_scaled[avail_batch].mean(axis=1) if avail_batch else np.nan
     scores["bio_score"] = metrics_scaled[avail_bio].mean(axis=1) if avail_bio else np.nan
