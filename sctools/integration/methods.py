@@ -53,9 +53,11 @@ def FilterSupportedKwargs(func, kwargs: dict) -> dict:
     Method signatures vary (e.g. `RunScanoramaIntegration` takes neither
     `n_pcs` nor `random_state`), so callers that build one generic kwargs
     dict for whichever method is being dispatched (`RunIntegrationBenchmark`,
-    `RunIntegrationComplete`) need this instead of hardcoding, per caller,
+    `RunIntegration`) need this instead of hardcoding, per caller,
     which methods accept which base kwargs.
     """
+    # inspect.signature(func).parameters: the set of parameter names `func`
+    # actually accepts, read from its signature (no need to hardcode this per method).
     accepted = inspect.signature(func).parameters
     return {k: v for k, v in kwargs.items() if k in accepted}
 
@@ -370,7 +372,7 @@ def RunScviIntegration(
 #   - adata.obs[batch_key] to split cells into batches/samples
 #   - integration features, usually HVGs
 #
-# In this pipeline, the input object is already subsetted to HVGs.
+# In this pipeline, *****the input object is already subsetted to HVGs******.
 # Therefore, anchor_features="all_hvgs" means:
 #   use all HVGs from the current run as integration features.
 #

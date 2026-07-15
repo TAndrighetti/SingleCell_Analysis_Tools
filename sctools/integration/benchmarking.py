@@ -54,6 +54,56 @@ def _Prefixed(name: str, out_prefix: str | None) -> str:
     return f"{out_prefix}.{name}" if out_prefix else name
 
 
+def _LoadScibRunMetrics(
+    metrics_dir: str | Path,
+    out_prefix: str | None = None,
+    run_ids: Iterable[int] | None = None,
+) -> pd.DataFrame:
+    """
+    Load and concatenate one source's per-run scIB metric CSVs into a single
+    table (rows = method_run combinations, columns = metrics).
+
+    Reads `{metrics_dir}/[{out_prefix}.]scib_metrics_run{run_id}.csv`
+    (tab-separated despite the `.csv` extension). If `run_ids` is None,
+    discovers them by globbing instead of assuming a fixed run count.
+    """
+    metrics_dir = Path(metrics_dir)
+    run_glob = _Prefixed("scib_metrics_run*.csv", out_prefix)
+
+    if run_ids is None:
+        # `glob` matches the files but doesn't sort them numerically (run10
+        # would sort before run2 as plain strings), so build a regex that
+        # pulls the run_id digits out of each filename and use that captured
+        # number as the sort key below.
+        pattern = re.compile(rf"{re.escape(out_prefix) + '.' if out_prefix else ''}scib_metrics_run(\d+)\.csv$")
+        run_files = sorted(metrics_dir.glob(run_glob), key=lambda p: int(pattern.search(p.name).group(1)))
+    else:
+        run_files = [metrics_dir / _Prefixed(f"scib_metrics_run{run_id}.csv", out_prefix) for run_id in run_ids]
+
+    if not run_files:
+        raise FileNotFoundError(f"No metrics files found matching {run_glob} in {metrics_dir}.")
+
+    metric_tables = [pd.read_csv(path, sep="\t", index_col=0) for path in run_files]
+    return pd.concat(metric_tables, axis=1).T
+
+
+def _LoadScibParams(
+    metrics_dir: str | Path,
+    out_prefix: str | None = None,
+    params_file: str | Path | None = None,
+) -> pd.DataFrame:
+    """Load one source's `scib_params_all_runs.csv`, one row per run_id."""
+    if params_file is None:
+        params_file = Path(metrics_dir) / _Prefixed("scib_params_all_runs.csv", out_prefix)
+    # The saved params CSV has one row per method x run; drop_duplicates
+    # keeps one row per run_id since params don't vary by method.
+    return (
+        pd.read_csv(params_file, sep="\t")
+        .drop(columns=["method", "col"], errors="ignore")
+        .drop_duplicates(subset="run_id")
+    )
+
+
 def BuildBenchmarkGrid(
     flavors: Iterable[str],
     n_top_genes_list: Iterable[int],
@@ -414,9 +464,11 @@ def RunIntegrationBenchmark(
 
 
 def SummarizeScibBenchmarkResults(
-    metrics_dir: str | Path,
+    metrics_dir: str | Path | None = None,
     out_prefix: str | None = None,
     *,
+    sources: dict[str, dict] | None = None,
+    label_col: str = "imputation",
     params_file: str | Path | None = None,
     run_ids: Iterable[int] | None = None,
     selected_metrics: tuple[str, ...] | None = None,
@@ -425,49 +477,83 @@ def SummarizeScibBenchmarkResults(
     batch_weight: float = 0.4,
     bio_weight: float = 0.6,
     save: bool = True,
+    save_dir: str | Path | None = None,
+    save_prefix: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Combine per-run scIB metric files into one scaled, weighted ranking of
     method/parameter combinations, merged with their run parameters.
 
-    Reads `{metrics_dir}/[{out_prefix}.]scib_metrics_run{run_id}.csv`
+    Single-source usage (unchanged): pass `metrics_dir` (+ optional
+    `out_prefix`). Reads `{metrics_dir}/[{out_prefix}.]scib_metrics_run{run_id}.csv`
     (tab-separated despite the `.csv` extension). If `run_ids` is None,
     discovers them by globbing instead of assuming a fixed run count.
+
+    Multi-source usage: pass `sources` instead of `metrics_dir`, a
+    `{label: {"metrics_dir": ..., "out_prefix": ..., "params_file": ...,
+    "run_ids": ...}}` mapping (only "metrics_dir" is required per source,
+    e.g. `{"ALRA": {"metrics_dir": ...}, "raw": {"metrics_dir": ...}}`). All
+    sources are pooled *before* min-max scaling, so runs from different
+    sources (e.g. with vs. without ALRA imputation) end up on one shared
+    [0, 1] scale and are directly comparable -- scaling each source
+    separately and concatenating afterwards would not give comparable scores.
+    Each source's label is attached as the `label_col` column (default
+    "imputation") and folded into the params merge key, since `run_id` alone
+    repeats across sources.
+
+    `save=True` (the default) writes the combined tables like the
+    single-source case does, but there's no single natural `metrics_dir` to
+    write into when pooling multiple sources -- pass `save_dir` (+ optional
+    `save_prefix`) to say where, or pass `save=False`.
 
     Returns
     -------
     (results_with_meta, metrics_raw, metrics_scaled)
     """
-    metrics_dir = Path(metrics_dir)
-    run_glob = _Prefixed("scib_metrics_run*.csv", out_prefix)
+    # `multi` selects which calling convention is in use: True for the
+    # multi-source path (a `sources` mapping was passed), False for the
+    # plain single-`metrics_dir` call. Everything below branches on it.
+    multi = sources is not None
+    # Reject the two invalid combinations (both given, or neither given) in
+    # one check: `multi == (metrics_dir is not None)` is True exactly when
+    # the two booleans agree, i.e. both True (both args passed) or both
+    # False (neither passed) -- the only valid case is that they disagree.
+    if multi == (metrics_dir is not None):
+        raise ValueError("Pass exactly one of `metrics_dir` or `sources`.")
 
-    if run_ids is None:
-        ## If i don't provide the run_ids that I want to summarize, I will glob the metrics_dir for all the run
-        ## files that match the pattern. The run_ids will be extracted from the filenames and sorted numerically.
-        ## This way, I can summarize all the runs that have been completed without having to specify them manually.
-        # `glob` matches the files but doesn't sort them numerically (run10
-        # would sort before run2 as plain strings), so build a regex that
-        # pulls the run_id digits out of each filename -- same prefix logic as
-        # `_Prefixed` (only prepend "{out_prefix}." if out_prefix was given) --
-        # and use that captured number as the sort key below.
-        pattern = re.compile(rf"{re.escape(out_prefix) + '.' if out_prefix else ''}scib_metrics_run(\d+)\.csv$")
-        run_files = sorted(metrics_dir.glob(run_glob), key=lambda p: int(pattern.search(p.name).group(1)))
+    if not multi:
+        # Wrap the single-source call into a one-entry `sources` dict (keyed
+        # by None, since there's no real label) so the loading/pooling logic
+        # below doesn't need a separate branch for the old single-dir shape.
+        sources = {None: dict(metrics_dir=metrics_dir, out_prefix=out_prefix, params_file=params_file, run_ids=run_ids)}
+
+    # Load each source independently, then pool: metrics_raw gets a
+    # (label_col, method_run) MultiIndex when multi=True so rows stay unique
+    # across sources that reuse the same run_id/method combinations; a plain
+    # method_run Index otherwise (identical to the old single-source shape).
+    raw_by_label = {}
+    params_by_label = {}
+    for label, src in sources.items():
+        mdir = Path(src["metrics_dir"])
+        pfx = src.get("out_prefix")
+        raw_by_label[label] = _LoadScibRunMetrics(mdir, pfx, src.get("run_ids"))
+        params_by_label[label] = _LoadScibParams(mdir, pfx, src.get("params_file"))
+
+    if multi:
+        metrics_raw = pd.concat(raw_by_label, axis=0, names=[label_col, None])
+        # params_meta doesn't need the same MultiIndex trick as metrics_raw --
+        # it's only ever looked up via merge(on=merge_keys), so the label just
+        # needs to be an explicit column (not part of the index) for `run_id`
+        # + label_col to work as the join key.
+        params_meta = pd.concat(
+            {label: df.assign(**{label_col: label}) for label, df in params_by_label.items()},
+            ignore_index=True,
+        )
+        merge_keys = ["run_id", label_col]
     else:
-        run_files = [metrics_dir / _Prefixed(f"scib_metrics_run{run_id}.csv", out_prefix) for run_id in run_ids]
-
-    if not run_files:
-        raise FileNotFoundError(f"No metrics files found matching {run_glob} in {metrics_dir}.")
-
-    # Load per-run metric tables
-    metric_tables = []
-    for path in run_files:
-        df = pd.read_csv(path, sep="\t", index_col=0)
-        metric_tables.append(df)
-
-    # Rows = method_run combinations; columns = metrics.
-    # this table is simply the concatenation of all the individual run metrics tables, 
-    # without any normalization or scaling applied. 
-    metrics_raw = pd.concat(metric_tables, axis=1).T
+        metrics_raw = next(iter(raw_by_label.values()))
+        params_meta = next(iter(params_by_label.values()))
+        merge_keys = ["run_id"]
 
     # None -> derive from batch_metrics + bio_metrics, so label-free and
     # labeled runs each pick up exactly the metrics they actually computed.
@@ -479,8 +565,8 @@ def SummarizeScibBenchmarkResults(
     # different columns), then drop any that came back all-NaN across every run.
     metrics = metrics_raw[[c for c in selected_metrics if c in metrics_raw.columns]].dropna(axis=1, how="all")
 
-    # Min-max scale per column; zero-range columns become NaN instead of a
-    # divide-by-zero.
+    # Min-max scale per column (pooled across all sources when multi=True);
+    # zero-range columns become NaN instead of a divide-by-zero.
     col_min = metrics.min()
     col_range = (metrics.max() - col_min).replace(0, np.nan)
     metrics_scaled = (metrics - col_min) / col_range
@@ -503,32 +589,43 @@ def SummarizeScibBenchmarkResults(
 
     results = pd.concat([metrics_scaled, scores], axis=1).sort_values("overall", ascending=False)
 
-    # Extract method/run_id from the index, formatted as "{method}_{run_id}".
-    results[["method", "run_id"]] = results.index.to_series().str.rsplit("_", n=1, expand=True)
+    # Extract method/run_id from the index, formatted as "{method}_{run_id}"
+    # (get_level_values(-1) is a no-op on a plain Index, so this also covers
+    # the single-source case; the label itself is the outer MultiIndex level).
+    method_run = pd.Series(results.index.get_level_values(-1), index=results.index)
+    results[["method", "run_id"]] = method_run.str.rsplit("_", n=1, expand=True)
     results["run_id"] = pd.to_numeric(results["run_id"], errors="coerce")
+    if multi:
+        results[label_col] = results.index.get_level_values(0)
+        # The index's outer level is also named label_col (from the concat
+        # above), which makes it ambiguous with the column of the same name
+        # during merge -- drop the index now that both pieces of information
+        # it held (method/run_id/label) live in columns.
+        results = results.reset_index(drop=True)
 
-    if params_file is None:
-        params_file = metrics_dir / _Prefixed("scib_params_all_runs.csv", out_prefix)
+    results_with_meta = results.merge(params_meta, on=merge_keys, how="left").reset_index(drop=True)
 
-    # The saved params CSV has one row per method x run; drop_duplicates
-    # keeps one row per run_id since params don't vary by method.
-    params_meta = (
-        pd.read_csv(params_file, sep="\t")
-        .drop(columns=["method", "col"], errors="ignore")
-        .drop_duplicates(subset="run_id")
-    )
-
-    results_with_meta = results.merge(params_meta, on="run_id", how="left").reset_index(drop=True)
-
-    meta_cols = ["method", "run_id"]
+    meta_cols = ["method", "run_id"] + ([label_col] if multi else [])
     score_cols = [c for c in selected_metrics + ("batch_score", "bio_score", "overall") if c in results_with_meta.columns]
     param_cols = [c for c in ("flavor", "n_top_genes", "n_pcs") if c in results_with_meta.columns]
 
     results_with_meta = results_with_meta[meta_cols + score_cols + param_cols]
 
     if save:
-        metrics_raw.to_csv(metrics_dir / _Prefixed("all_metrics_raw.tsv", out_prefix), sep="\t")
-        results.to_csv(metrics_dir / _Prefixed("scib_metrics_summary.tsv", out_prefix), sep="\t")
-        results_with_meta.to_csv(metrics_dir / _Prefixed("scib_metrics_with_params.tsv", out_prefix), sep="\t", index=False)
+        if multi:
+            if save_dir is None:
+                raise ValueError("save=True with `sources` requires `save_dir` (optionally with `save_prefix`).")
+            out_dir = Path(save_dir)
+        else:
+            # sources[None] is the single-source dict built above -- reusing
+            # its metrics_dir/out_prefix here keeps the saved filenames
+            # identical to pre-`sources` behavior when save_prefix isn't
+            # explicitly overridden.
+            out_dir = Path(sources[None]["metrics_dir"])
+            if save_prefix is None:
+                save_prefix = sources[None].get("out_prefix")
+        metrics_raw.to_csv(out_dir / _Prefixed("all_metrics_raw.tsv", save_prefix), sep="\t")
+        results.to_csv(out_dir / _Prefixed("scib_metrics_summary.tsv", save_prefix), sep="\t")
+        results_with_meta.to_csv(out_dir / _Prefixed("scib_metrics_with_params.tsv", save_prefix), sep="\t", index=False)
 
     return results_with_meta, metrics_raw, metrics_scaled

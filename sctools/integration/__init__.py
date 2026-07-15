@@ -6,12 +6,14 @@ Batch-integration methods, scIB-based benchmarking, and cell curation for
 single-cell RNA-seq data.
 
 Single production run (one method, one parameter set):
-    RunIntegrationComplete()
-        -> preprocessing.NormalizeHvgPcaKnn()
+    preprocessing.NormalizeHvgPcaKnn()  # run this yourself first
+    RunIntegration()
         -> methods.Run<Method>Integration()
-        -> workflow.RunLeidenClustering()
+        -> preprocessing.RunNeighborsAndUmap()
+    RunLeidenClustering()  # separate step, called on RunIntegration's output
     AttachHvgResultsToFullAdata()
-    UpdateCellsToRemove()  # iterative low-quality cluster curation
+    RemoveClustersFromOriginal()  # iterative low-quality cluster curation
+        -> UpdateCellsToRemove()  # logs the decision, returns cumulative cells
 
 Benchmarking a grid of methods/parameters:
     BuildBenchmarkGrid()
@@ -31,7 +33,7 @@ from .benchmarking import (
     RunScibMetricsWithLabel,
     SummarizeScibBenchmarkResults,
 )
-from .curation import UpdateCellsToRemove
+from .curation import RemoveClustersFromOriginal, UpdateCellsToRemove
 from .methods import (
     SCIB_EMBED_BY_METHOD,
     SUPPORTED_METHODS,
@@ -44,7 +46,7 @@ from .methods import (
 from .workflow import (
     AttachHvgResultsToFullAdata,
     PlotUmap,
-    RunIntegrationComplete,
+    RunIntegration,
     RunLeidenClustering,
 )
 
@@ -59,7 +61,7 @@ __all__ = [
     "RunSeuratAnchorsIntegration",
     "RunSeuratAnchors",
     # Workflow
-    "RunIntegrationComplete",
+    "RunIntegration",
     "AttachHvgResultsToFullAdata",
     "RunLeidenClustering",
     "PlotUmap",
@@ -70,5 +72,6 @@ __all__ = [
     "RunScibMetricsLabelFree",
     "SummarizeScibBenchmarkResults",
     # Curation
+    "RemoveClustersFromOriginal",
     "UpdateCellsToRemove",
 ]

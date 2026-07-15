@@ -83,8 +83,9 @@ pip install -e .
 | `PlotUmap` | Save a UMAP plot to disk for a given representation |
 | `ApplyIntegrationMethods` | Apply BBKNN / Seurat / Scanorama / Harmony / scVI, return one AnnData per method |
 | `Clustering` | Leiden clustering at multiple resolutions + UMAP plots |
-| `RunIntegrationComplete` | Full single-method pipeline: `NormalizeHvgPcaKnn` -> integration -> clustering |
+| `RunIntegration` | Full single-method pipeline: `NormalizeHvgPcaKnn` -> integration -> clustering |
 | `AttachHvgResultsToFullAdata` | Attach HVG-based embeddings/clusters back onto the full (all-genes) AnnData |
+| `RemoveClustersFromOriginal` | Flag clusters in an integrated AnnData, log via `UpdateCellsToRemove`, reload + filter the pristine original |
 | `UpdateCellsToRemove` | Log + accumulate low-quality clusters to remove across iterative curation passes |
 | `RunScibMetricsWithLeiden` | scIB metrics (PCR_batch, iLISI, hvg_score, cell_cycle, silhouette) using Leiden as proxy labels |
 | `BuildCombinationsDictAndParamsDf` | Build a flavor x n_top_genes x n_pcs grid for benchmarking |
@@ -155,10 +156,10 @@ adata = RunAlraOnAnnData(adata, input_layer="QC_filtered_log1p", output_layer="a
 ## Typical integration workflow (single method, production run)
 
 ```python
-from sctools.integration import RunIntegrationComplete, AttachHvgResultsToFullAdata
+from sctools.integration import RunIntegration, AttachHvgResultsToFullAdata
 
 # 10. Preprocess + integrate with one method + Leiden-cluster the result
-adata_run, adata_cl_hvg = RunIntegrationComplete(
+adata_run, adata_cl_hvg = RunIntegration(
     adata, method="harmony", out_dir="plots/umaps",
     flavor="cell_ranger", n_top_genes=1000, n_pcs=20, n_neighbors=15,
 )

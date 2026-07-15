@@ -407,48 +407,6 @@ def RunNeighborsAndUmap(
     )
 
 
-def StorePreprocessingParams(
-    adata: AnnData,
-    *,
-    input_layer: str,
-    log1p_layer: str,
-    batch_key: str | None,
-    n_top_genes: int,
-    flavor: str,
-    target_sum: float,
-    n_pcs_requested: int,
-    n_neighbors: int,
-    scale_for_pca: bool,
-    max_value: float | None,
-    pca_input_state: str,
-    random_state: int,
-) -> None:
-    """
-    Store preprocessing parameters in `adata.uns`.
-    """
-    n_pcs_used = int(adata.obsm["X_pca"].shape[1])
-
-    adata.uns.setdefault("preprocessing_params", {})
-
-    adata.uns["preprocessing_params"]["NormalizeHvgPcaKnn"] = {
-        "input_layer": input_layer,
-        "log1p_layer": log1p_layer,
-        "x_state_after_function": "normalized_log1p",
-        "counts_layer_preserved": input_layer,
-        "batch_key": batch_key,
-        "n_top_genes": int(n_top_genes),
-        "n_hvgs": int(adata.var["highly_variable"].sum()),
-        "flavor": flavor,
-        "target_sum": float(target_sum),
-        "n_pcs_requested": int(n_pcs_requested),
-        "n_pcs_used": n_pcs_used,
-        "n_neighbors": int(n_neighbors),
-        "scale_for_pca": bool(scale_for_pca),
-        "max_value": max_value,
-        "pca_input_state": pca_input_state,
-        "random_state": int(random_state),
-    }
-
 def NormalizeHvgPcaKnn(
     adata: AnnData,
     *,
@@ -582,21 +540,28 @@ def NormalizeHvgPcaKnn(
         random_state=random_state,
     )
 
-    StorePreprocessingParams(
-        adata,
-        input_layer=input_layer,
-        log1p_layer=log1p_layer,
-        batch_key=batch_key,
-        n_top_genes=n_top_genes,
-        flavor=flavor,
-        target_sum=target_sum,
-        n_pcs_requested=n_pcs,
-        n_neighbors=n_neighbors,
-        scale_for_pca=scale_for_pca,
-        max_value=max_value,
-        pca_input_state=pca_input_state,
-        random_state=random_state,
-    )
+    n_pcs_used = int(adata.obsm["X_pca"].shape[1])
+
+    ## Store preprocessing parameters in adata.uns["preprocessing_params"] for reproducibility.
+    adata.uns.setdefault("preprocessing_params", {})
+    adata.uns["preprocessing_params"]["NormalizeHvgPcaKnn"] = {
+        "input_layer": input_layer,
+        "log1p_layer": log1p_layer,
+        "x_state_after_function": "normalized_log1p",
+        "counts_layer_preserved": input_layer,
+        "batch_key": batch_key,
+        "n_top_genes": int(n_top_genes),
+        "n_hvgs": int(adata.var["highly_variable"].sum()),
+        "flavor": flavor,
+        "target_sum": float(target_sum),
+        "n_pcs_requested": int(n_pcs),
+        "n_pcs_used": n_pcs_used,
+        "n_neighbors": int(n_neighbors),
+        "scale_for_pca": bool(scale_for_pca),
+        "max_value": max_value,
+        "pca_input_state": pca_input_state,
+        "random_state": int(random_state),
+    }
 
     logger.info(
         "NormalizeHvgPcaKnn finished: %d cells x %d genes, %d HVGs, %d PCs, "
