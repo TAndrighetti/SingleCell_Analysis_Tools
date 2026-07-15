@@ -34,6 +34,13 @@ from sctools.preprocessing import (
 )
 from sctools.alra import RunAlraOnAnnData
 
+from sctools.annotation import (
+    CalculateModuleScores,
+    PlotModuleScoresUMAPs,
+    CalculateAUCellWithDecoupler,
+    PlotAUCellUMAPs,
+)
+
 from sctools.integration import (
     RunSeuratAnchors,
     PlotUmap,
@@ -88,6 +95,11 @@ __all__ = [
     "RunNeighborsAndUmap",
     # Imputation
     "RunAlraOnAnnData",
+    # Annotation
+    "CalculateModuleScores",
+    "PlotModuleScoresUMAPs",
+    "CalculateAUCellWithDecoupler",
+    "PlotAUCellUMAPs",
     # Integration
     "RunSeuratAnchors",
     "PlotUmap",

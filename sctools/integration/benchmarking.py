@@ -375,9 +375,17 @@ def RunIntegrationBenchmark(
             random_state=random_state,
         )
 
-        # Baseline for this run: same HVGs/PCA as the integrated copies
-        # below, so each run is compared against its own matching baseline.
-        # it will be the reference: the non integrated adata_run is the baseline for scoring, so it must be the same HVG/PCA as the integrated copies. The integrated copies are created from adata_run[:, adata_run.var["highly_variable"]], so we need to create a reference adata_hvg_ref that has the same HVGs and PCA as adata_run. This is done by subsetting adata_run to only the highly variable genes and copying it to adata_hvg_ref. This way, each run is compared against its own matching baseline.
+        # adata_hvg_ref: HVG-only subset, used as *input to the integration
+        # methods* (Seurat/Harmony/scVI expect a matrix already restricted to
+        # the run's HVGs). It is NOT used as the scib scoring reference below
+        # -- cell_cycle_conservation and hvg_overlap need genes outside the
+        # HVG set (cell-cycle markers routinely fall outside HVG selection,
+        # and hvg_overlap recomputes HVGs from scratch to compare against).
+        # adata_run itself stays full-gene and already carries a valid
+        # HVG-based X_pca (RunPcaOnHvgs computes PCA on a temporary HVG-only
+        # copy and writes obsm["X_pca"] back onto adata_run), so it is the
+        # correct scoring reference -- mirrors what the pre-port notebook did
+        # with `sc.tl.pca(..., use_highly_variable=True)` on the full adata.
         adata_hvg_ref = adata_run[:, adata_run.var["highly_variable"]].copy()
 
         # n_pcs is this run's value -- methods that use it are listed here;
@@ -421,13 +429,15 @@ def RunIntegrationBenchmark(
             # with type_="embed" internally -- no per-method lookup needed.
             embed = SCIB_EMBED_BY_METHOD[method]
 
+            # adata_run (full-gene, not adata_hvg_ref) is the scoring
+            # reference -- see comment above adata_hvg_ref's definition.
             if label_key is not None:
                 metrics_series = RunScibMetricsWithLabel(
-                    adata_hvg_ref, adata_int, organism, label_key, batch_key=batch_key, embed=embed,
+                    adata_run, adata_int, organism, label_key, batch_key=batch_key, embed=embed,
                 )
             else:
                 metrics_series = RunScibMetricsLabelFree(
-                    adata_hvg_ref, adata_int, organism, batch_key=batch_key, embed=embed,
+                    adata_run, adata_int, organism, batch_key=batch_key, embed=embed,
                 )
 
             col_name = f"{method}_{run_id}"

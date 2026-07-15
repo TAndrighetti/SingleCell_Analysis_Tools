@@ -75,6 +75,15 @@ pip install -e .
 |---|---|
 | `RunAlraOnAnnData` | Run the official R `ALRA` package (`choose_k()` + `alra()`) via rpy2 |
 
+### `sctools.annotation` — Marker-based cell-type scoring (AUCell requires `decoupler`)
+
+| Function | Description |
+|---|---|
+| `CalculateModuleScores` | Per-signature module score (`sc.tl.score_genes`), normalized by sqrt(n_genes) |
+| `PlotModuleScoresUMAPs` | UMAP grid of module scores, diverging color scale centered at 0 |
+| `CalculateAUCellWithDecoupler` | Per-signature AUCell score (`decoupler.mt.aucell`), normalized by sqrt(n_genes) |
+| `PlotAUCellUMAPs` | UMAP grid of AUCell scores, sequential color scale from 0 |
+
 ### `sctools.integration` — Batch integration, clustering, benchmarking
 
 | Function | Description |
@@ -197,6 +206,25 @@ all_metrics_df, params_df = RunIntegrationTests(
     organism="mouse",
     methods=["seurat", "harmony", "scanorama", "bbknn", "scvi"],
 )
+```
+
+## Typical annotation workflow (marker-based scoring)
+
+```python
+from sctools.annotation import (
+    CalculateModuleScores, PlotModuleScoresUMAPs,
+    CalculateAUCellWithDecoupler, PlotAUCellUMAPs,
+)
+
+marker_genes_dic = {"Goblet": ["Muc2", "Tff3"], "Colonocyte": ["Slc26a3", "Car1"]}
+
+# 14. Module scores (sc.tl.score_genes) + UMAPs
+adata = CalculateModuleScores(adata, marker_genes_dic, layer="QC_filtered_log1p")
+PlotModuleScoresUMAPs(adata)
+
+# 15. AUCell scores (decoupler) + UMAPs
+adata = CalculateAUCellWithDecoupler(adata, marker_genes_dic, layer="QC_filtered_log1p")
+PlotAUCellUMAPs(adata)
 ```
 
 ## Requirements
