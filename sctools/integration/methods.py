@@ -454,6 +454,7 @@ def RunSeuratAnchors(
     counts_layer: str = "QC_filtered",
     data_layer: str = "logcounts",
     anchor_features: str | int | list[str] = "all_hvgs",
+    random_state: int = 42,
 ):
     """
     Low-level R bridge: Seurat CCA-anchor integration (via rpy2). Converts
@@ -465,6 +466,11 @@ def RunSeuratAnchors(
 
     anchor_features: "all_hvgs" (default, uses every gene in `adata_seurat`)
     | int (let Seurat pick that many features) | list[str] (explicit genes).
+
+    random_state: FindIntegrationAnchors() has no seed.use argument -- it
+    defaults to nn.method="annoy", an approximate (stochastic) nearest-neighbor
+    search -- so this is applied as a global R set.seed() before the anchor
+    search runs.
     """
     import anndata2ri
     import rpy2.robjects as ro
@@ -487,6 +493,7 @@ def RunSeuratAnchors(
         ro.globalenv["batch_key"] = batch_key
         ro.globalenv["counts_layer"] = counts_layer
         ro.globalenv["data_layer"] = data_layer
+        ro.globalenv["seed_use"] = random_state
 
         if anchor_features == "all_hvgs":
             ro.globalenv["anchor_features_mode"] = "all_hvgs"
@@ -505,6 +512,8 @@ def RunSeuratAnchors(
             suppressMessages({
                 suppressWarnings({
                     library(Seurat)
+
+                    set.seed(seed_use)
 
                     seurat <- as.Seurat(
                         adata_seurat,
@@ -591,6 +600,7 @@ def RunSeuratAnchorsIntegration(
         counts_layer=counts_layer,
         data_layer=log_layer,
         anchor_features=anchor_features,
+        random_state=random_state,
     )
 
     adata.layers["seurat"] = integrated_mat
