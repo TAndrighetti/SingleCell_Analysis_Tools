@@ -45,6 +45,17 @@ SCIB_EMBED_BY_METHOD = {
     "seurat": "X_pca",
 }
 
+# adata.layers key holding each method's corrected *expression* matrix, for
+# methods that produce one (currently only Seurat -- see
+# RunSeuratAnchorsIntegration's `adata.layers["seurat"]`). Harmony/Scanorama/
+# scVI are embedding-only: they never correct expression, only obsm[...], so
+# they have no entry here. Used by benchmarking.py to score expression-level
+# scib metrics (hvg_overlap, cell_cycle_conservation) against the actual
+# corrected matrix instead of the untouched pre-integration `.X`.
+SCIB_CORRECTED_LAYER_BY_METHOD = {
+    "seurat": "seurat",
+}
+
 
 def FilterSupportedKwargs(func, kwargs: dict) -> dict:
     """
@@ -149,12 +160,17 @@ def RunHarmonyIntegration(
 
     logger.info("Running Harmony (batch_key=%s)", batch_key)
 
+    # FIX: random_state was accepted as a parameter but never forwarded to
+    # harmony_integrate, so harmonypy's internal k-means step (and therefore
+    # X_harmony) was not actually seeded by it, producing a different
+    # embedding -- and downstream UMAP -- on every run.
     sce.pp.harmony_integrate(
         adata,
         key=batch_key,
         basis=basis,
         adjusted_basis="X_harmony",
         verbose=1,
+        random_state=random_state,
     )
     return adata
 
