@@ -31,7 +31,13 @@ from anndata import AnnData
 
 from sctools.preprocessing import RunHighlyVariableGenes, RunPcaOnHvgs
 
-from .methods import SCIB_EMBED_BY_METHOD, SUPPORTED_METHODS, _METHOD_FUNCS, FilterSupportedKwargs
+from .methods import (
+    SCIB_CORRECTED_LAYER_BY_METHOD,
+    SCIB_EMBED_BY_METHOD,
+    SUPPORTED_METHODS,
+    _METHOD_FUNCS,
+    FilterSupportedKwargs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -429,15 +435,32 @@ def RunIntegrationBenchmark(
             # with type_="embed" internally -- no per-method lookup needed.
             embed = SCIB_EMBED_BY_METHOD[method]
 
+            # hvg_overlap/cell_cycle_conservation read adata_int.X, not
+            # obsm[embed] -- for embedding-only methods (harmony/scanorama/
+            # scvi) .X is legitimately still the pre-integration matrix (they
+            # never correct expression, so those two metrics are inherently
+            # near-1.0/uninformative for them, which is expected). Seurat DOES
+            # correct expression, but keeps it in adata.layers["seurat"] so
+            # the object can still be used for downstream neighbors/UMAP off
+            # X_pca -- swap .X to that corrected layer on a scoring-only copy
+            # so hvg_overlap/cell_cycle_conservation actually see Seurat's
+            # correction instead of silently scoring the untouched input.
+            correction_layer = SCIB_CORRECTED_LAYER_BY_METHOD.get(method)
+            if correction_layer and correction_layer in adata_int.layers:
+                adata_scoring = adata_int.copy()
+                adata_scoring.X = adata_scoring.layers[correction_layer].copy()
+            else:
+                adata_scoring = adata_int
+
             # adata_run (full-gene, not adata_hvg_ref) is the scoring
             # reference -- see comment above adata_hvg_ref's definition.
             if label_key is not None:
                 metrics_series = RunScibMetricsWithLabel(
-                    adata_run, adata_int, organism, label_key, batch_key=batch_key, embed=embed,
+                    adata_run, adata_scoring, organism, label_key, batch_key=batch_key, embed=embed,
                 )
             else:
                 metrics_series = RunScibMetricsLabelFree(
-                    adata_run, adata_int, organism, batch_key=batch_key, embed=embed,
+                    adata_run, adata_scoring, organism, batch_key=batch_key, embed=embed,
                 )
 
             col_name = f"{method}_{run_id}"
@@ -575,11 +598,16 @@ def SummarizeScibBenchmarkResults(
     # different columns), then drop any that came back all-NaN across every run.
     metrics = metrics_raw[[c for c in selected_metrics if c in metrics_raw.columns]].dropna(axis=1, how="all")
 
-    # Min-max scale per column (pooled across all sources when multi=True);
-    # zero-range columns become NaN instead of a divide-by-zero.
+    # Min-max scale per column (pooled across all sources when multi=True).
+    # A zero-range column (every run scored identically) has nothing to
+    # rescale -- min-max would divide by zero, so instead of NaN-ing the
+    # whole column out, keep it at its raw value (scib metrics are already
+    # ~[0, 1] scores, so this stays comparable to the scaled columns).
     col_min = metrics.min()
-    col_range = (metrics.max() - col_min).replace(0, np.nan)
-    metrics_scaled = (metrics - col_min) / col_range
+    col_range = metrics.max() - col_min
+    metrics_scaled = (metrics - col_min).div(col_range.replace(0, np.nan))
+    zero_range_cols = col_range[col_range == 0].index
+    metrics_scaled[zero_range_cols] = metrics[zero_range_cols]
 
     # batch_metrics/bio_metrics are the full canonical lists; narrow each down
     # to whichever of those columns actually survived into metrics_scaled

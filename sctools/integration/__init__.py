@@ -35,6 +35,7 @@ from .benchmarking import (
 )
 from .curation import RemoveClustersFromOriginal, UpdateCellsToRemove
 from .methods import (
+    SCIB_CORRECTED_LAYER_BY_METHOD,
     SCIB_EMBED_BY_METHOD,
     SUPPORTED_METHODS,
     RunHarmonyIntegration,
@@ -52,6 +53,7 @@ from .workflow import (
 
 __all__ = [
     # Method maps
+    "SCIB_CORRECTED_LAYER_BY_METHOD",
     "SCIB_EMBED_BY_METHOD",
     "SUPPORTED_METHODS",
     # Methods

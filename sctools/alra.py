@@ -29,6 +29,7 @@ adata = RunAlraOnAnnData(
     rank=None,                         # use ALRA::choose_k() to estimate k automatically
     use_mkl=False,                     # use standard ALRA; set True only if ALRA MKL support is installed
     store_as_sparse=True,              # save output as sparse matrix to keep the AnnData object lighter
+    random_state=42,                   # seeds R's set.seed() -- choose_k() and alra() (rsvd) are otherwise stochastic
 )
 """
 
@@ -46,7 +47,7 @@ from sctools.preprocessing import CheckNormalizedLayer
 logger = logging.getLogger(__name__)
 
 
-def _RunAlra(data, genes, cells, rank: Optional[int] = None, use_mkl: bool = False):
+def _RunAlra(data, genes, cells, rank: Optional[int] = None, use_mkl: bool = False, random_state: int = 42):
     """
     Run official ALRA from R using rpy2.
 
@@ -63,6 +64,8 @@ def _RunAlra(data, genes, cells, rank: Optional[int] = None, use_mkl: bool = Fal
         Rank k for ALRA. If None, ALRA::choose_k() is used.
     use_mkl
         Whether to request ALRA's MKL implementation, if available.
+    random_state
+        Seed applied via R's `set.seed()` before `choose_k()`/`alra()` run.
 
     Returns
     -------
@@ -87,10 +90,19 @@ def _RunAlra(data, genes, cells, rank: Optional[int] = None, use_mkl: bool = Fal
     globalenv["estimate_rank"] = ro.BoolVector([rank is None])
     globalenv["alra_rank"] = ro.IntVector([0 if rank is None else int(rank)])
     globalenv["use_mkl"] = ro.BoolVector([bool(use_mkl)])
+    globalenv["seed_use"] = ro.IntVector([int(random_state)])
 
     r_code = """
     library(ALRA)
     library(Matrix)
+
+    # FIX: choose_k() picks a rank via a randomized permutation-style test, and
+    # alra() itself uses randomized SVD (rsvd) once the matrix is wider than a
+    # couple hundred genes (true here -- this runs on the full log1p layer,
+    # not the HVG subset). Neither was seeded before, so rank_used and the
+    # imputed matrix changed on every run even with the rest of the pipeline
+    # (PCA/UMAP/Leiden/Seurat) fixed at random_state=42.
+    set.seed(seed_use)
 
     # Add names for traceability.
     rownames(data) <- cells
@@ -194,6 +206,7 @@ def RunAlraOnAnnData(
     rank: Optional[int] = None,
     use_mkl: bool = False,
     store_as_sparse: bool = True,
+    random_state: int = 42,
 ) -> AnnData:
     """
     Run official ALRA on an AnnData layer and store the output in adata.layers.
@@ -215,6 +228,11 @@ def RunAlraOnAnnData(
     store_as_sparse
         If True, store the ALRA output as scipy csr_matrix.
         If False, store it as a dense numpy array.
+    random_state
+        Seed for R's `set.seed()`, applied before `choose_k()`/`alra()`.
+        Both use randomized algorithms (rank estimation and, for wide
+        matrices, randomized SVD) that are otherwise unseeded -- see FIX
+        note in `_RunAlra`.
 
     Returns
     -------
@@ -259,6 +277,7 @@ def RunAlraOnAnnData(
         cells=cells,
         rank=rank,
         use_mkl=use_mkl,
+        random_state=random_state,
     )
 
     if msg:
@@ -294,6 +313,7 @@ def RunAlraOnAnnData(
         "use_mkl": bool(use_mkl),
         "store_as_sparse": bool(store_as_sparse),
         "matrix_orientation": "cells x genes",
+        "random_state": int(random_state),
         "messages": msg,
     }
 
