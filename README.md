@@ -61,6 +61,7 @@ pip install -e .
 | Function | Description |
 |---|---|
 | `PlotHeatmap` | Generic heatmap with optional cell annotations |
+| `PlotSignificanceHeatmap` | Generic value+significance heatmap from a long-format table (color by a value column, "*" by a p-value/padj column, optional `restrict_to_significant` row filter, optional category sidebar) |
 
 ### `sctools.preprocessing` — Normalization, HVG, PCA, kNN
 
@@ -99,6 +100,21 @@ pip install -e .
 | `RunScibMetricsWithLeiden` | scIB metrics (PCR_batch, iLISI, hvg_score, cell_cycle, silhouette) using Leiden as proxy labels |
 | `BuildCombinationsDictAndParamsDf` | Build a flavor x n_top_genes x n_pcs grid for benchmarking |
 | `RunIntegrationTests` | Run the full grid: preprocess, integrate, score each combination with scIB |
+
+### `sctools.degs` — Pseudobulk DE (PyDESeq2) & hallmark/pathway activity (decoupler ULM)
+
+| Function | Description |
+|---|---|
+| `Pseudobulking` | Aggregate counts per (celltype, sample) with `decoupler` |
+| `PseudoPCA` | Optional QC/exploration PCA on pseudobulk profiles -- never required for DEGs, never modifies raw counts |
+| `PseudoFeatSelection` | Per-celltype gene filtering before DE (`decoupler` filter_by_expr/filter_by_prop) |
+| `PseudoDESeq2` | Run a DESeq2 contrast on raw pseudobulk counts for one celltype (PyDESeq2), with a minimum-replicates check |
+| `VolcanoGridByGroup` | Volcano plot grid, one panel per celltype/group |
+| `RunULM` | Run ULM (`decoupler.mt.ulm`) for ONE input (one celltype's `PseudoDESeq2` data, or a whole AnnData) against any network (hallmark, progeny, collectri, ...), + optional barplot -- loop over celltypes yourself |
+| `MeltActsPadjToLong` | Combine several celltypes' stored acts/padj tables into one tidy long-format table -- feed straight into `sctools.plots.PlotSignificanceHeatmap` |
+| `BuildHallmarkToCategoryMap` | Build a `{hallmark: category}` lookup from a category dict |
+| `BuildHallmarkLongTable` | Long-format table of significant hallmark/pathway hits |
+| `SummarizeHallmarkCategories` | Per-celltype/category summary (counts, mean score, dominant direction) |
 
 ## Typical QC workflow
 
@@ -225,6 +241,57 @@ PlotModuleScoresUMAPs(adata)
 # 15. AUCell scores (decoupler) + UMAPs
 adata = CalculateAUCellWithDecoupler(adata, marker_genes_dic, layer="QC_filtered_log1p")
 PlotAUCellUMAPs(adata)
+```
+
+## Typical DEGs / hallmark activity workflow (pseudobulk PyDESeq2 + decoupler ULM)
+
+```python
+from sctools.degs import (
+    Pseudobulking, PseudoPCA, PseudoFeatSelection, PseudoDESeq2,
+    VolcanoGridByGroup, RunULM, MeltActsPadjToLong,
+)
+from sctools.plots import PlotSignificanceHeatmap
+
+# 16. Aggregate counts per (celltype, sample); PCA here is optional QC only,
+#     never required for DEGs -- suitable_celltypes comes from your own
+#     cell/replicate-count check (kept notebook-local, not in this package).
+pdata = Pseudobulking(adata, celltype_col="celltype", sample_col="sample")
+pdata = PseudoPCA(pdata, celltype_col="celltype", condition_col="condition")
+
+# 17. Per-celltype DE: filter genes, run PyDESeq2 on raw pseudobulk counts, collect results
+pdata_by_celltype = {ct: {} for ct in suitable_celltypes}
+for ct in suitable_celltypes:
+    pdata_by_celltype[ct]["pdata"] = PseudoFeatSelection(pdata, celltype=ct, celltype_col="celltype", plot=False)
+    pdata_by_celltype[ct]["results_df"], pdata_by_celltype[ct]["data"] = PseudoDESeq2(
+        pdata_by_celltype[ct]["pdata"], design_col="condition",
+        normal_condition="CTRL", compare_condition="TREATED", plot_volcano=False,
+    )
+
+# 18. Volcano grid across celltypes
+import pandas as pd
+degs = pd.concat(
+    [df["results_df"].assign(celltype=ct) for ct, df in pdata_by_celltype.items()]
+).reset_index().rename(columns={"index": "gene_id"})
+VolcanoGridByGroup(degs, group_col="celltype", col_gene="gene_id")
+
+# 19. Hallmark activity (decoupler ULM) across celltypes -- RunULM handles ONE
+#     celltype at a time (like PseudoFeatSelection/PseudoDESeq2), so you loop
+#     yourself and choose the storage keys (namespaced by network here, so a
+#     later run with a different net, e.g. progeny, won't overwrite this one).
+import decoupler as dc
+hallmark = dc.op.hallmark(organism="mouse")
+for ct in suitable_celltypes:
+    hm_acts, hm_padj = RunULM(pdata_by_celltype[ct]["data"], hallmark, contrast_name="TREATED.vs.CTRL", plot=False)
+    pdata_by_celltype[ct]["hallmark_acts"] = hm_acts
+    pdata_by_celltype[ct]["hallmark_padj"] = hm_padj
+
+ulm_long = MeltActsPadjToLong(
+    pdata_by_celltype, "hallmark_acts", "hallmark_padj", "TREATED.vs.CTRL", feature_col="hallmark",
+)
+heatmap_df, padj_df, annot_df = PlotSignificanceHeatmap(
+    ulm_long, x="celltype", y="hallmark", value_col="score", pvalue_col="padj",
+    restrict_to_significant=True, title="Hallmark activities (TREATED vs CTRL)",
+)
 ```
 
 ## Requirements

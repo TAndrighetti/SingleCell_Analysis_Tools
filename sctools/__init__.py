@@ -22,7 +22,7 @@ if not _sctools_logger.handlers:
     _sctools_logger.addHandler(_handler)
     _sctools_logger.setLevel(logging.INFO)
 
-from sctools.plots import PlotHeatmap
+from sctools.plots import PlotHeatmap, PlotSignificanceHeatmap
 from sctools.io import CatAdata
 from sctools.preprocessing import (
     NormalizeHvgPcaKnn,
@@ -60,6 +60,20 @@ from sctools.integration import (
     RunLeidenClustering,
 )
 
+from sctools.degs import (
+    Pseudobulking,
+    PseudoPCA,
+    PseudoFeatSelection,
+    PseudoDESeq2,
+    VolcanoGridByGroup,
+    RunULM,
+    MeltActsPadjToLong,
+    RunULMHeatmap,
+    BuildHallmarkToCategoryMap,
+    BuildHallmarkLongTable,
+    SummarizeHallmarkCategories,
+)
+
 from sctools.qc import (
     # Ambient RNA
     AmbientRNA,
@@ -86,6 +100,7 @@ __all__ = [
     "CatAdata",
     # Generic plots
     "PlotHeatmap",
+    "PlotSignificanceHeatmap",
     # Preprocessing
     "NormalizeHvgPcaKnn",
     "CheckNormalizedLayer",
@@ -117,6 +132,18 @@ __all__ = [
     "RunScviIntegration",
     "RunSeuratAnchorsIntegration",
     "RunLeidenClustering",
+    # DEGs (pseudobulk PyDESeq2 + hallmark/pathway activity)
+    "Pseudobulking",
+    "PseudoPCA",
+    "PseudoFeatSelection",
+    "PseudoDESeq2",
+    "VolcanoGridByGroup",
+    "RunULM",
+    "MeltActsPadjToLong",
+    "RunULMHeatmap",
+    "BuildHallmarkToCategoryMap",
+    "BuildHallmarkLongTable",
+    "SummarizeHallmarkCategories",
     # Ambient RNA
     "AmbientRNA",
     # Doublets

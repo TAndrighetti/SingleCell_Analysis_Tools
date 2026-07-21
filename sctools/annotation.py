@@ -31,11 +31,123 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import seaborn as sns
 from anndata import AnnData
 
 logger = logging.getLogger(__name__)
 
 
+############################################
+####### MARKERS
+
+def MarkerInData(marker_genes, adata):
+    marker_genes_in_data = {}
+    for ct, markers in marker_genes.items():
+        markers_found = []
+        for marker in markers:
+            if marker in adata.var.index:
+                markers_found.append(marker)
+        marker_genes_in_data[ct] = markers_found
+    return marker_genes_in_data
+
+
+####### Top 10
+def RankGenesByCluster(
+    adata,
+    groupby="leiden_res1",
+    layer="QC_filtered_log1p",
+    n_genes=10,
+    filtra_mt_rb_hb=False
+):
+    # 1️⃣ Identifica DEGs (usa Wilcoxon, ideal para scRNA-seq)
+    sc.tl.rank_genes_groups(adata, groupby=groupby, layer=layer, method="wilcoxon")
+
+    # 2️⃣ Extrai top genes por cluster
+    cluster_genes = {}
+
+    for c, group in enumerate(adata.uns["rank_genes_groups"]["names"].dtype.names):
+        all_genes = list(adata.uns["rank_genes_groups"]["names"][group])
+
+        if filtra_mt_rb_hb:
+            clean_genes = [
+                gene for gene in all_genes
+                if ("mt" not in gene.lower())
+                and ("rp" not in gene.lower())
+                and ("hb" not in gene.lower())
+            ]
+            genes = clean_genes[:n_genes]
+        else:
+            genes = all_genes[:n_genes]
+
+        cluster_genes[group] = genes  # salva no dicionário
+
+    # 3️⃣ Gera a lista consolidada (sem duplicatas, mantendo ordem)
+    top_genes = list(dict.fromkeys([g for genes in cluster_genes.values() for g in genes]))
+
+    # 4️⃣ Calcula médias de expressão por cluster
+    if layer in adata.layers:
+        expr = pd.DataFrame(
+            adata[:, top_genes].layers[layer].toarray(),
+            index=adata.obs_names,
+            columns=top_genes,
+        )
+    else:
+        expr = adata[:, top_genes].to_df()
+
+    expr[groupby] = adata.obs[groupby].values
+    mean_exp = expr.groupby(groupby).mean().T  # genes nas linhas, clusters nas colunas
+
+    # 5️⃣ Escala por gene (Z-score)
+    mean_vals = mean_exp.mean(axis=1).to_numpy()[:, np.newaxis]
+    std_vals = mean_exp.std(axis=1).replace(0, np.nan).to_numpy()[:, np.newaxis]
+    scaled = (mean_exp.to_numpy() - mean_vals) / std_vals
+    scaled_df = pd.DataFrame(scaled, index=mean_exp.index, columns=mean_exp.columns)
+
+    # 6️⃣ Retorna ambos: dicionário de genes e matriz escalada
+    return cluster_genes, scaled_df
+
+def PlotTopDEGsHeatmap(
+    scaled_df,
+    title="",
+    cmap="magma",
+    figsize=(10, 8)):
+
+    """
+    Gera um heatmap com os top genes diferencialmente expressos por cluster.
+    """
+
+    # 5️⃣ Plot
+    plt.figure(figsize=figsize)
+
+    ax = sns.heatmap(
+        scaled_df,
+        cmap=cmap,
+        center=0,
+        yticklabels=True,
+        cbar=True,
+        square=False,
+        xticklabels=True,
+        linewidths=0,      # evita linhas internas
+        linecolor='white',    # garante ausência de cor entre células
+        rasterized=True,   # força renderização contínua (sem linhas de pixel)
+    )
+
+    # Remove bordas e grades residuais
+    ax.set_facecolor('none')  # fundo transparente
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.grid(False)
+        
+    plt.title(title, fontsize=13)
+    plt.xlabel("Cluster")
+    plt.ylabel("Genes")
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+############################################
 # ── Module scores (sc.tl.score_genes) ───────────────────────────────────────
 
 def CalculateModuleScores(

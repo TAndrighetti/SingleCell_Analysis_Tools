@@ -2,7 +2,10 @@ README.md
 pyproject.toml
 sctools/__init__.py
 sctools/alra.py
+sctools/annotation.py
+sctools/degs.py
 sctools/io.py
+sctools/non_used_functions.py
 sctools/plots.py
 sctools/preprocessing.py
 sctools/qc.py
@@ -13,9 +16,6 @@ sctools.egg-info/requires.txt
 sctools.egg-info/top_level.txt
 sctools/integration/__init__.py
 sctools/integration/benchmarking.py
-sctools/integration/clustering.py
-sctools/integration/constants.py
 sctools/integration/curation.py
 sctools/integration/methods.py
-sctools/integration/plotting.py
 sctools/integration/workflow.py

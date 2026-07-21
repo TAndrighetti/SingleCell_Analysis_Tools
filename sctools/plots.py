@@ -5,7 +5,10 @@ Plotting utilities for single-cell RNA-seq analysis.
 
 Functions
 ---------
-PlotHeatmap           – generic heatmap from a long-format DataFrame
+PlotHeatmap             – generic heatmap from a long-format DataFrame
+PlotSignificanceHeatmap – generic value+significance heatmap (score/log2FC
+                          colored, "*" by p-value/padj threshold, optional
+                          category sidebar) from a long-format DataFrame
 plot_qc_violins       – violin grid per QC metric, grouped by sample
 plot_metric_pairs     – paired boxplot comparing two AnnData sets (before/after)
 plot_covariates       – 4-panel covariate overview (violin × 3 + scatter)
@@ -18,6 +21,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 
@@ -122,6 +126,187 @@ def PlotHeatmap(
         plt.close(fig)
 
     return fig, ax, im
+
+
+def PlotSignificanceHeatmap(
+    df,
+    *,
+    x: str,
+    y: str,
+    value_col: str,
+    pvalue_col: str,
+    padj_threshold: float = 0.05,
+    restrict_to_significant: bool = False,
+    order_x: list | None = None,
+    order_y: list | None = None,
+    category_map: dict | None = None,
+    sort_by_magnitude: bool = True,
+    title: str = "",
+    figsize: tuple[float, float] = (10, 6),
+    cmap: str = "RdBu_r",
+    center: float = 0,
+    xlabel: str | None = None,
+    ylabel: str = "",
+    cbar_label: str | None = None,
+    category_legend_title: str = "Category",
+    plot: bool = True,
+    save: str | Path | None = None,
+) -> tuple:
+    """Generic significance heatmap from a long-format DataFrame.
+
+    Pivots `df` into a `y`-by-`x` matrix colored by `value_col` (e.g. log2FC,
+    a module/pathway activity score), with a "*" wherever `pvalue_col` is
+    below `padj_threshold`. `pvalue_col` can point at either a raw p-value
+    or an already-adjusted one -- whichever column you pass is what gets
+    thresholded, this function doesn't correct it for you.
+
+    Row (`y`) order is resolved in this priority: `order_y` if given: use it
+    as-is; else `category_map` if given: group rows by category (in the
+    dict's iteration order), sorting each group by `sort_by_magnitude` if
+    set; else just `sort_by_magnitude` alone, or insertion order.
+    `category_map` additionally draws a colored sidebar + legend grouping
+    the rows, independent of whether it also drove the ordering (pass
+    `order_y` alongside it to keep sidebar colors but control order
+    yourself).
+
+    Parameters
+    ----------
+    df : long-format DataFrame -- one row per (x, y) combination.
+    x, y : columns used as the heatmap's column/row axes.
+    value_col : column mapped to cell color.
+    pvalue_col : column thresholded against `padj_threshold` for the "*" annotation.
+    restrict_to_significant : drop `y` values that aren't below
+        `padj_threshold` for at least one `x` -- e.g. only show
+        hallmarks/pathways/TFs significant in at least one celltype.
+    order_x, order_y : optional explicit axis orders (values not present are dropped).
+    category_map : optional {category: [y values]} -- draws a left-side
+        color bar grouping rows, and (unless `order_y` is given) also
+        drives row order.
+    sort_by_magnitude : sort rows (or each category's rows) by summed |value_col|.
+    title, figsize, cmap, center, xlabel, ylabel : passed through to the plot.
+    cbar_label : colorbar label -- defaults to `value_col`.
+    category_legend_title : legend title for the category sidebar.
+    plot : whether to render the figure. Set False to just get the pivoted tables back.
+    save : path to save the figure to. `None` skips saving.
+
+    Returns
+    -------
+    value_table, padj_table, annot_table : the pivoted, ordered (y-by-x)
+        DataFrames -- `annot_table` is "*"/"" by `padj_threshold`. Empty
+        DataFrames if nothing is left to plot (e.g. `restrict_to_significant`
+        dropped everything).
+    """
+    if restrict_to_significant:
+        significant_rows = df.loc[df[pvalue_col] < padj_threshold, y].unique()
+        df = df[df[y].isin(significant_rows)]
+
+    if df.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty
+
+    value_table = df.pivot(index=y, columns=x, values=value_col)
+    padj_table = df.pivot(index=y, columns=x, values=pvalue_col)
+
+    if order_x is not None:
+        cols = [c for c in order_x if c in value_table.columns]
+        value_table = value_table[cols]
+        padj_table = padj_table[cols]
+
+    row_to_category = {}
+    if category_map is not None:
+        for category, items in category_map.items():
+            for item in items:
+                row_to_category[item] = category
+
+    if order_y is not None:
+        rows = [r for r in order_y if r in value_table.index]
+    elif category_map is not None:
+        ordered = [
+            item
+            for items in category_map.values()
+            for item in items
+            if item in value_table.index
+        ]
+        remaining = [r for r in value_table.index if r not in ordered]
+        if sort_by_magnitude:
+            remaining = (
+                value_table.loc[remaining]
+                .abs().sum(axis=1)
+                .sort_values(ascending=False)
+                .index.tolist()
+            )
+        rows = ordered + remaining
+    elif sort_by_magnitude:
+        rows = value_table.abs().sum(axis=1).sort_values(ascending=False).index.tolist()
+    else:
+        rows = list(value_table.index)
+
+    value_table = value_table.loc[rows]
+    padj_table = padj_table.loc[rows]
+    annot_table = (padj_table < padj_threshold).replace({True: "*", False: ""})
+
+    if plot:
+        import seaborn as sns
+        from matplotlib.patches import Patch, Rectangle
+
+        plt.figure(figsize=figsize)
+        ax = plt.gca()
+        sns.heatmap(
+            value_table,
+            ax=ax,
+            cmap=cmap,
+            center=center,
+            linewidths=0.4,
+            linecolor="white",
+            cbar_kws={"label": cbar_label or value_col},
+            annot=annot_table,
+            fmt="",
+        )
+
+        plt.title(title, fontsize=14, weight="bold", pad=12)
+        plt.xlabel(xlabel if xlabel is not None else x)
+        plt.ylabel(ylabel)
+        plt.xticks(rotation=45, ha="right")
+        plt.yticks(rotation=0)
+
+        if row_to_category:
+            categories = [row_to_category.get(r, "uncategorized") for r in value_table.index]
+            unique_categories = list(dict.fromkeys(categories))
+            palette = sns.color_palette("tab20", n_colors=len(unique_categories))
+            category_colors = dict(zip(unique_categories, palette))
+
+            bar_width = 0.25
+            for pos, category in enumerate(categories):
+                ax.add_patch(
+                    Rectangle(
+                        (-bar_width, pos), bar_width, 1,
+                        color=category_colors[category],
+                        clip_on=False, linewidth=0,
+                    )
+                )
+            ax.set_xlim(-bar_width, value_table.shape[1])
+
+            legend_handles = [
+                Patch(color=category_colors[cat], label=cat)
+                for cat in unique_categories
+            ]
+            ax.legend(
+                handles=legend_handles,
+                title=category_legend_title,
+                bbox_to_anchor=(1.35, 1),
+                loc="upper left",
+                frameon=False,
+            )
+
+        plt.tight_layout()
+
+        if save is not None:
+            Path(save).parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(save, dpi=300, bbox_inches="tight")
+
+        plt.show()
+
+    return value_table, padj_table, annot_table
 
 
 # ── QC violins ────────────────────────────────────────────────────────────────
