@@ -110,11 +110,10 @@ pip install -e .
 | `PseudoFeatSelection` | Per-celltype gene filtering before DE (`decoupler` filter_by_expr/filter_by_prop) |
 | `PseudoDESeq2` | Run a DESeq2 contrast on raw pseudobulk counts for one celltype (PyDESeq2), with a minimum-replicates check |
 | `VolcanoGridByGroup` | Volcano plot grid, one panel per celltype/group |
-| `RunULM` | Run ULM (`decoupler.mt.ulm`) for ONE input (one celltype's `PseudoDESeq2` data, or a whole AnnData) against any network (hallmark, progeny, collectri, ...), + optional barplot -- loop over celltypes yourself |
+| `RunULM` | Run ULM (`decoupler.mt.ulm`) for ONE input (one celltype's `PseudoDESeq2` data, or a whole AnnData) against any network (hallmark, progeny, collectri, ...), + optional barplot (pass `ax=` to draw into a shared grid) -- loop over celltypes yourself |
 | `MeltActsPadjToLong` | Combine several celltypes' stored acts/padj tables into one tidy long-format table -- feed straight into `sctools.plots.PlotSignificanceHeatmap` |
-| `BuildHallmarkToCategoryMap` | Build a `{hallmark: category}` lookup from a category dict |
-| `BuildHallmarkLongTable` | Long-format table of significant hallmark/pathway hits |
-| `SummarizeHallmarkCategories` | Per-celltype/category summary (counts, mean score, dominant direction) |
+| `BuildSignificantFeatureTable` | Long-format table restricted to significant hits, + category/direction columns (optional category dict with prefix stripping, e.g. `"HALLMARK_"`) |
+| `SummarizeFeatureCategories` | Per-celltype/category summary (counts, mean score, dominant direction) |
 
 ## Typical QC workflow
 

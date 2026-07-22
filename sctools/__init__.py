@@ -68,10 +68,8 @@ from sctools.degs import (
     VolcanoGridByGroup,
     RunULM,
     MeltActsPadjToLong,
-    RunULMHeatmap,
-    BuildHallmarkToCategoryMap,
-    BuildHallmarkLongTable,
-    SummarizeHallmarkCategories,
+    BuildSignificantFeatureTable,
+    SummarizeFeatureCategories,
 )
 
 from sctools.qc import (
@@ -140,10 +138,8 @@ __all__ = [
     "VolcanoGridByGroup",
     "RunULM",
     "MeltActsPadjToLong",
-    "RunULMHeatmap",
-    "BuildHallmarkToCategoryMap",
-    "BuildHallmarkLongTable",
-    "SummarizeHallmarkCategories",
+    "BuildSignificantFeatureTable",
+    "SummarizeFeatureCategories",
     # Ambient RNA
     "AmbientRNA",
     # Doublets

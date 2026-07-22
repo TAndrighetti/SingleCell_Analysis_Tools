@@ -18,6 +18,12 @@ Not ported:
   hallmark-specific logic left once genericized (just "restrict to rows
   significant somewhere, then plot"). That's now
   `sctools.plots.PlotSignificanceHeatmap(..., restrict_to_significant=True)`.
+- `RunULMHeatmap` -- a composed "loop + melt + heatmap for all celltypes"
+  convenience, but it was never actually used anywhere: the barplot grid
+  a real notebook needed isn't something `dc.pl.barplot` does per-figure,
+  so that per-celltype loop ended up living directly in the notebook
+  instead (`RunULM(..., ax=...)` into a shared `plt.subplots` grid). Removed
+  to avoid keeping an unused, harder-to-maintain duplicate around.
 
 Typical usage order:
     EvaluateCelltypesForPseudobulk()    -> (notebook-local, not in this module) pick celltypes with enough cells/replicates
@@ -27,34 +33,30 @@ Typical usage order:
     PseudoDESeq2()                      -> DESeq2 contrast on raw pseudobulk counts (PyDESeq2)
     VolcanoGridByGroup()                -> volcano grid, one panel per celltype
 
-Hallmark / pathway activity (decoupler ULM, e.g. dc.op.hallmark, dc.op.progeny,
-dc.op.collectri, or any other decoupler net -- `RunULM` is generic over the
-network, and over the input: one celltype's `PseudoDESeq2` `data`, or a
-whole AnnData):
-    RunULM()                      -> run ULM for ONE input against any net, + optional barplot
-    MeltActsPadjToLong()          -> combine several celltypes' stored acts/padj into one tidy table
-    RunULMHeatmap()               -> RunULM + MeltActsPadjToLong + heatmap, composed for all celltypes at once
-    BuildHallmarkToCategoryMap()  -> {hallmark: category} lookup from a category dict
-    BuildHallmarkLongTable()      -> long-format table of significant hits
-    SummarizeHallmarkCategories() -> per-celltype/category summary
+Feature-set / pathway activity (decoupler ULM, e.g. dc.op.hallmark,
+dc.op.progeny, dc.op.collectri, or any other decoupler net -- everything
+below is generic over the network and its feature naming, not specific to
+MSigDB hallmarks):
+    RunULM()                       -> run ULM for ONE input against any net, + optional barplot (pass `ax=` for a grid)
+    MeltActsPadjToLong()           -> combine several celltypes' stored acts/padj into one tidy table
+    BuildSignificantFeatureTable() -> long-format table restricted to significant hits, + category/direction columns
+    SummarizeFeatureCategories()   -> per-celltype/category summary from that table
 
 The heatmap itself is `sctools.plots.PlotSignificanceHeatmap` -- generic
 (any long-format table with an x column, a y column, a color value column,
-and a p-value/padj column), not specific to hallmarks or ULM. Pass
-`restrict_to_significant=True` to only show y-values (e.g. hallmarks) that
-are significant in at least one x (e.g. celltype).
+and a p-value/padj column). Pass `restrict_to_significant=True` to only
+show y-values (e.g. hallmarks) that are significant in at least one x (e.g.
+celltype); its own `category_map` param takes the same `{category:
+[features]}` shape as `_BuildFeatureToCategoryMap`/`BuildSignificantFeatureTable`.
 
 `RunULM` runs on a single input, matching `PseudoFeatSelection`/
 `PseudoDESeq2`'s "one call per celltype, loop lives in the caller" pattern
-instead of looping internally over a `pdata_by_celltype` dict -- it's the
-primitive, for when you need per-celltype control. `RunULMHeatmap` is the
-composed convenience on top of it (loop + `MeltActsPadjToLong` + heatmap in
-one call) for the common case: running one network across every celltype
-and plotting the result, e.g. once for hallmark and once for progeny on
-the same `pdata_by_celltype` (namespaced by `net_name` so they don't
-collide).
+instead of looping internally over a `pdata_by_celltype` dict.
 
-`BuildHallmarkLongTable`/`SummarizeHallmarkCategories` derive their
+`_BuildFeatureToCategoryMap`'s `prefix` param strips a naming-convention
+prefix (e.g. `prefix="HALLMARK_"` for MSigDB) -- leave it empty for feature
+sets with no such prefix (progeny pathways, collectri TFs, ...).
+`BuildSignificantFeatureTable`/`SummarizeFeatureCategories` derive their
 "direction" labels (e.g. "increased_in_ANTIB") from the actual
 `compare_condition` half of `contrast_name` (`"{compare_condition}.vs.
 {normal_condition}"`) rather than a hardcoded "KO"/"WT" -- works for any
@@ -83,10 +85,8 @@ __all__ = [
     "VolcanoGridByGroup",
     "RunULM",
     "MeltActsPadjToLong",
-    "RunULMHeatmap",
-    "BuildHallmarkToCategoryMap",
-    "BuildHallmarkLongTable",
-    "SummarizeHallmarkCategories",
+    "BuildSignificantFeatureTable",
+    "SummarizeFeatureCategories",
 ]
 
 
@@ -139,7 +139,7 @@ def Pseudobulking(
         layer=counts_layer,
     )
     # dc.pp.pseudobulk also generates QC metrics used below and by
-    # PseudoFeatSelection: pdata.obs["psbulk_n_cells"] (cells aggregated per
+    # PseudoFeatSelection: pdata.obs["psbulk_cells"] (cells aggregated per
     # pseudobulk sample), pdata.obs["psbulk_counts"] (total counts per
     # sample), and pdata.layers["psbulk_props"] (per gene, the fraction of
     # those cells with a non-zero count -- what filter_by_prop filters on).
@@ -333,17 +333,23 @@ def PseudoPCA(
         sc.pl.pca_variance_ratio(pdata_out)
 
         if "rank_obsm" in pdata_out.uns:
-            # With few pseudobulk samples, a tail PC can have ~zero variance
-            # across samples, or a group can be perfectly separated -- both
-            # push rankby_obsm's (BH-corrected) p-value to exactly 0, which
-            # becomes Inf under -log10 and breaks this plot's axis scaling.
-            # PCA itself already succeeded and is stored above; don't let a
-            # degenerate stat on an optional QC plot fail the whole function.
+            # dc.pl.obsm dendrogram-clusters the (few) tested obs_keys
+            # (celltype/condition/id, typically only 2-3 rows). If two of
+            # them end up with numerically identical -log10(padj) across
+            # the shown PCs (e.g. both non-significant -> both ~0), that
+            # pair merges at exactly distance 0, producing a zero-height
+            # dendrogram segment that marsilea's coordinate normalization
+            # divides by (ValueError: Axis limits cannot be NaN or Inf).
+            # dendrogram=False avoids this class of tie entirely; the
+            # try/except stays as a safety net for anything else, since
+            # PCA itself already succeeded and is stored above -- this is
+            # an optional QC plot, not worth failing the whole function.
             try:
                 dc.pl.obsm(
                     adata=pdata_out,
                     key="rank_obsm",
                     nvar=5,
+                    dendrogram=False,
                     titles=["PC scores", "Adjusted p-values"],
                     figsize=(5, 5),
                 )
@@ -447,6 +453,7 @@ def PseudoDESeq2(
     min_replicates: int = 1,
     n_cpus: int = 8,
     plot_volcano: bool = True,
+    deseq_quiet:bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run PyDESeq2 for one celltype's pseudobulk and return results_df + stat row.
@@ -497,6 +504,7 @@ def PseudoDESeq2(
         dds,
         contrast=[design_col, compare_condition, normal_condition],
         inference=inference,
+        quiet=deseq_quiet,
     )
 
     # Compute Wald test
@@ -870,225 +878,140 @@ def RunULM(
     return hm_acts, hm_padj
 
 
-def RunULMHeatmap(
-    pdata_by_celltype: dict,
-    net,
-    *,
-    net_name: str = "net",
-    feature_col: str = "feature",
-    celltypes: list[str] | None = None,
-    contrast_name: str = "KO.vs.WT",
-    padj_threshold: float = 0.05,
-    restrict_to_significant: bool = True,
-    barplot: bool = True,
-    barplot_figsize=(6, 5),
-    barplot_save_dir: str | None = None,
-    title: str | None = None,
-    figsize=(10, 8),
-    cmap: str = "RdBu_r",
-    center: float = 0,
-    cbar_label: str | None = None,
-    save: str | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Run ULM for `net` across all celltypes in `pdata_by_celltype`, and plot
-    a significance heatmap.
 
-    Composed convenience for the common case -- loops `RunULM` over
-    `celltypes` (storing results under `f"{net_name}_acts"`/`f"{net_name}_padj"`
-    so different networks don't collide), combines them with
-    `MeltActsPadjToLong`, and plots via `sctools.plots.PlotSignificanceHeatmap`.
-    Call those three yourself instead if you need more control over any one
-    step (e.g. a per-celltype barplot title, or a different plot per network).
+def _BuildFeatureToCategoryMap(category_map: dict, prefix: str = "") -> dict:
+    """
+    Invert a {category: [features]} dict into {feature: category}.
 
     Parameters
     ----------
-    pdata_by_celltype : dict --> {celltype: {"data": ..., ...}}, as built by your PseudoDESeq2 loop.
-    net : network passed to `dc.mt.ulm` -- any decoupler net (hallmark, progeny, collectri, ...).
-    net_name : str --> Used for the storage keys, default title, and default colorbar label.
-    feature_col : str --> Column name for the network's features in the long
-        table and the heatmap's y-axis (e.g. "hallmark", "pathway", "tf").
-    celltypes : list[str] or None --> Defaults to all keys of `pdata_by_celltype`.
-    contrast_name : str --> Row in each celltype's acts/padj used for both
-        the barplots and the heatmap (e.g. "KO.vs.WT").
-    padj_threshold : float --> Significance cutoff, for barplots and the heatmap "*".
-    restrict_to_significant : bool --> Only show features significant in >=1 celltype.
-    barplot, barplot_figsize, barplot_save_dir : per-celltype barplot controls
-        (`RunULM`'s `plot`/`figsize`/`save_path`, the latter auto-named per celltype).
-    title, figsize, cmap, center, cbar_label, save : passed to `PlotSignificanceHeatmap`.
-
-    Returns
-    -------
-    heatmap_df, padj_df, annot_df : pd.DataFrame  (rows = features, cols = celltypes)
+    category_map : dict -> {category: list/tuple of features}.
+    prefix : str -> optional prefix to strip, e.g. `prefix="HALLMARK_"` for
+        MSigDB hallmark names. Both the prefixed and unprefixed forms of
+        each feature get mapped, so lookups work regardless of which form
+        your data uses. Leave empty (default) for feature sets with no such
+        prefix convention (progeny pathways, collectri TFs, ...).
     """
-    from sctools.plots import PlotSignificanceHeatmap
+    feature_to_category = {}
 
-    if celltypes is None:
-        celltypes = list(pdata_by_celltype.keys())
+    for category, features in category_map.items():
+        for feature in features:
+            feature_clean = feature.replace(prefix, "") if prefix else feature
+            feature_to_category[feature_clean] = category
+            if prefix:
+                feature_to_category[f"{prefix}{feature_clean}"] = category
 
-    name_acts = f"{net_name}_acts"
-    name_padj = f"{net_name}_padj"
+    return feature_to_category
 
-    for celltype in celltypes:
-        hm_acts, hm_padj = RunULM(
-            pdata_by_celltype[celltype]["data"],
-            net,
-            contrast_name=contrast_name,
-            padj_threshold=padj_threshold,
-            plot=barplot,
-            figsize=barplot_figsize,
-            save_path=(
-                f"{barplot_save_dir}/{celltype}_ULM_barplot.png"
-                if barplot_save_dir is not None
-                else None
-            ),
-        )
-        pdata_by_celltype[celltype][name_acts] = hm_acts
-        pdata_by_celltype[celltype][name_padj] = hm_padj
-
-    long_df = MeltActsPadjToLong(
-        pdata_by_celltype, name_acts, name_padj, contrast_name, feature_col=feature_col
-    )
-
-    if title is None:
-        title = f"{net_name} activities ({contrast_name})\n(* = padj < {padj_threshold})"
-
-    return PlotSignificanceHeatmap(
-        long_df,
-        x="celltype",
-        y=feature_col,
-        value_col="score",
-        pvalue_col="padj",
-        padj_threshold=padj_threshold,
-        restrict_to_significant=restrict_to_significant,
-        title=title,
-        figsize=figsize,
-        cmap=cmap,
-        center=center,
-        cbar_label=cbar_label or f"{net_name} score",
-        save=save,
-    )
+##################################################
+# The functions below build two levels of enrichment summary on top of a
+# tidy per-feature table (e.g. MeltActsPadjToLong's output):
+#   BuildSignificantFeatureTable -> one row per significant (celltype,
+#     feature) hit, with a "category" (from category_map) and "direction"
+#     (increased/decreased in compare_condition) column added.
+#   SummarizeFeatureCategories -> one row per (celltype, category), built
+#     on top of that -- counts, mean score, dominant direction. Answers
+#     "which functional categories change most, and in which direction,
+#     per celltype" without reading the heatmap feature by feature.
 
 
-def BuildHallmarkToCategoryMap(hallmark_categories):
+def BuildSignificantFeatureTable(
+    long_df: pd.DataFrame,
+    *,
+    feature_col: str = "feature",
+    celltype_col: str = "celltype",
+    value_col: str = "score",
+    pvalue_col: str = "padj",
+    category_map: dict | None = None,
+    category_prefix: str = "",
+    padj_threshold: float = 0.05,
+    contrast_name: str = "KO.vs.WT",
+) -> pd.DataFrame:
     """
-    hallmark_categories : dict -> {category: tuple/list of hallmarks}.
+    Restrict a long-format ULM/enrichment table (e.g. from
+    `MeltActsPadjToLong`) to significant hits, and add `category` and
+    `direction` columns.
+
+    Parameters
+    ----------
+    long_df : long-format table, e.g. `MeltActsPadjToLong`'s output.
+    feature_col, celltype_col, value_col, pvalue_col : column names in `long_df`.
+    category_map, category_prefix : passed to `_BuildFeatureToCategoryMap`
+        if `category_map` is given; features not found get "uncategorized".
+    padj_threshold : float -> cutoff applied to `pvalue_col`.
+    contrast_name : str -> formatted as "{compare_condition}.vs.{normal_condition}"
+        (matches `PseudoDESeq2`'s `data` naming). The "compare_condition"
+        half labels the "direction" column (e.g. "increased_in_ANTIB") --
+        not tied to any specific condition names.
     """
-
-    hallmark_to_category = {}
-
-    for category, hallmarks in hallmark_categories.items():
-        for hallmark in hallmarks:
-            hallmark_clean = hallmark.replace("HALLMARK_", "")
-            hallmark_to_category[hallmark_clean] = category
-            hallmark_to_category[f"HALLMARK_{hallmark_clean}"] = category
-
-    return hallmark_to_category
-
-
-def BuildHallmarkLongTable(
-    heatmap_df,
-    padj_df,
-    hallmark_categories=None,
-    padj_threshold=0.05,
-    contrast_name="KO.vs.WT",
-):
-    """
-    heatmap_df : pd.DataFrame -> rows = hallmarks, columns = celltypes, values = scores.
-    padj_df : pd.DataFrame -> rows = hallmarks, columns = celltypes, values = adjusted p-values.
-    hallmark_categories : dict | None -> {category: hallmarks}.
-    padj_threshold : float -> adjusted p-value cutoff.
-    contrast_name : str -> contrast label, formatted as
-        "{compare_condition}.vs.{normal_condition}" (matches PseudoDESeq2's
-        `data` naming). The "compare_condition" half is used to label the
-        "direction" column (e.g. "increased_in_ANTIB") -- not tied to any
-        specific condition names.
-    """
-
     compare_condition = contrast_name.split(".vs.")[0]
     direction_up = f"increased_in_{compare_condition}"
     direction_down = f"decreased_in_{compare_condition}"
 
-    hallmark_to_category = (
-        BuildHallmarkToCategoryMap(hallmark_categories)
-        if hallmark_categories is not None
+    feature_to_category = (
+        _BuildFeatureToCategoryMap(category_map, prefix=category_prefix)
+        if category_map is not None
         else {}
     )
 
-    records = []
+    df = long_df.dropna(subset=[value_col, pvalue_col])
+    df = df[df[pvalue_col] < padj_threshold].copy()
 
-    for hallmark in heatmap_df.index:
-        hallmark_clean = str(hallmark).replace("HALLMARK_", "")
-        category = hallmark_to_category.get(hallmark_clean, "uncategorized")
+    if df.empty:
+        return df
 
-        for celltype in heatmap_df.columns:
-            score = heatmap_df.loc[hallmark, celltype]
-            padj = padj_df.loc[hallmark, celltype]
+    df["category"] = df[feature_col].map(feature_to_category).fillna("uncategorized")
+    df["direction"] = np.where(df[value_col] > 0, direction_up, direction_down)
+    df["contrast"] = contrast_name
 
-            if pd.isna(score) or pd.isna(padj):
-                continue
-
-            if padj >= padj_threshold:
-                continue
-
-            direction = direction_up if score > 0 else direction_down
-
-            records.append({
-                "contrast": contrast_name,
-                "celltype": celltype,
-                "hallmark": hallmark_clean,
-                "category": category,
-                "ULM_score": score,
-                "padj": padj,
-                "direction": direction,
-            })
-
-    hallmark_long = pd.DataFrame(records)
-
-    if hallmark_long.empty:
-        return hallmark_long
-
-    hallmark_long = hallmark_long.sort_values(
-        ["celltype", "category", "direction", "padj", "ULM_score"],
+    return df.sort_values(
+        [celltype_col, "category", "direction", pvalue_col, value_col],
         ascending=[True, True, True, True, False],
     )
 
-    return hallmark_long
 
-
-def SummarizeHallmarkCategories(
-    hallmark_long,
-    hallmark_categories=None,
-):
+def SummarizeFeatureCategories(
+    significant_long_df: pd.DataFrame,
+    *,
+    feature_col: str = "feature",
+    celltype_col: str = "celltype",
+    value_col: str = "score",
+    pvalue_col: str = "padj",
+    category_map: dict | None = None,
+) -> pd.DataFrame:
     """
-    hallmark_long : pd.DataFrame -> output from BuildHallmarkLongTable.
-    hallmark_categories : dict | None -> {category: hallmarks}, used to compute fractions.
+    Per-celltype/category summary (counts, mean/median score, dominant
+    direction) from `BuildSignificantFeatureTable`'s output.
 
-    "up"/"down" are resolved from whichever `hallmark_long["direction"]`
+    "up"/"down" are resolved from whichever `significant_long_df["direction"]`
     values are actually present (e.g. "increased_in_ANTIB"/
     "decreased_in_ANTIB") -- not hardcoded to any specific condition name.
-    """
 
-    if hallmark_long.empty:
+    category_map : optional {category: [features]}, used to compute
+        fraction-of-category-significant columns.
+    """
+    df = significant_long_df
+
+    if df.empty:
         return pd.DataFrame()
 
-    directions = [d for d in hallmark_long["direction"].unique() if d != "mixed"]
+    directions = [d for d in df["direction"].unique() if d != "mixed"]
     direction_up = next((d for d in directions if d.startswith("increased_in_")), "increased")
     direction_down = next((d for d in directions if d.startswith("decreased_in_")), "decreased")
 
-    def _hallmarks_with_direction(idx, direction):
-        matches = hallmark_long.loc[idx, "direction"].eq(direction)
-        return "; ".join(sorted(hallmark_long.loc[idx[matches], "hallmark"].unique()))
+    def _features_with_direction(idx, direction):
+        matches = df.loc[idx, "direction"].eq(direction)
+        return "; ".join(sorted(df.loc[idx[matches], feature_col].unique()))
 
-    summary = hallmark_long.groupby(["celltype", "category"]).agg(
-        n_significant_hallmarks=("hallmark", "nunique"),
+    summary = df.groupby([celltype_col, "category"]).agg(
+        n_significant_features=(feature_col, "nunique"),
         n_up=("direction", lambda x: (x == direction_up).sum()),
         n_down=("direction", lambda x: (x == direction_down).sum()),
-        mean_score=("ULM_score", "mean"),
-        median_score=("ULM_score", "median"),
-        min_padj=("padj", "min"),
-        hallmarks_up=("hallmark", lambda x: _hallmarks_with_direction(x.index, direction_up)),
-        hallmarks_down=("hallmark", lambda x: _hallmarks_with_direction(x.index, direction_down)),
+        mean_score=(value_col, "mean"),
+        median_score=(value_col, "median"),
+        min_padj=(pvalue_col, "min"),
+        features_up=(feature_col, lambda x: _features_with_direction(x.index, direction_up)),
+        features_down=(feature_col, lambda x: _features_with_direction(x.index, direction_down)),
     ).reset_index()
 
     summary["dominant_direction"] = np.select(
@@ -1097,14 +1020,12 @@ def SummarizeHallmarkCategories(
         default="mixed",
     )
 
-    if hallmark_categories is not None:
-        category_size = {category: len(set(hallmarks)) for category, hallmarks in hallmark_categories.items()}
+    if category_map is not None:
+        category_size = {category: len(set(features)) for category, features in category_map.items()}
 
-        summary["n_total_hallmarks_in_category"] = summary["category"].map(category_size).fillna(np.nan)
-        summary["fraction_significant"] = summary["n_significant_hallmarks"] / summary["n_total_hallmarks_in_category"]
-        summary["fraction_up"] = summary["n_up"] / summary["n_total_hallmarks_in_category"]
-        summary["fraction_down"] = summary["n_down"] / summary["n_total_hallmarks_in_category"]
+        summary["n_total_features_in_category"] = summary["category"].map(category_size).fillna(np.nan)
+        summary["fraction_significant"] = summary["n_significant_features"] / summary["n_total_features_in_category"]
+        summary["fraction_up"] = summary["n_up"] / summary["n_total_features_in_category"]
+        summary["fraction_down"] = summary["n_down"] / summary["n_total_features_in_category"]
 
-    summary = summary.sort_values(["celltype", "dominant_direction", "category"])
-
-    return summary
+    return summary.sort_values([celltype_col, "dominant_direction", "category"])
