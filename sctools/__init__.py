@@ -66,6 +66,9 @@ from sctools.degs import (
     PseudoFeatSelection,
     PseudoDESeq2,
     VolcanoGridByGroup,
+)
+
+from sctools.functionalanalysis import (
     RunULM,
     MeltActsPadjToLong,
     BuildSignificantFeatureTable,
@@ -130,12 +133,13 @@ __all__ = [
     "RunScviIntegration",
     "RunSeuratAnchorsIntegration",
     "RunLeidenClustering",
-    # DEGs (pseudobulk PyDESeq2 + hallmark/pathway activity)
+    # DEGs (pseudobulk PyDESeq2)
     "Pseudobulking",
     "PseudoPCA",
     "PseudoFeatSelection",
     "PseudoDESeq2",
     "VolcanoGridByGroup",
+    # Functional analysis (hallmark/pathway activity, decoupler ULM)
     "RunULM",
     "MeltActsPadjToLong",
     "BuildSignificantFeatureTable",

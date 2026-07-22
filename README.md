@@ -101,7 +101,7 @@ pip install -e .
 | `BuildCombinationsDictAndParamsDf` | Build a flavor x n_top_genes x n_pcs grid for benchmarking |
 | `RunIntegrationTests` | Run the full grid: preprocess, integrate, score each combination with scIB |
 
-### `sctools.degs` — Pseudobulk DE (PyDESeq2) & hallmark/pathway activity (decoupler ULM)
+### `sctools.degs` — Pseudobulk DE (PyDESeq2)
 
 | Function | Description |
 |---|---|
@@ -110,6 +110,11 @@ pip install -e .
 | `PseudoFeatSelection` | Per-celltype gene filtering before DE (`decoupler` filter_by_expr/filter_by_prop) |
 | `PseudoDESeq2` | Run a DESeq2 contrast on raw pseudobulk counts for one celltype (PyDESeq2), with a minimum-replicates check |
 | `VolcanoGridByGroup` | Volcano plot grid, one panel per celltype/group |
+
+### `sctools.functionalanalysis` — Feature-set / pathway activity (decoupler ULM)
+
+| Function | Description |
+|---|---|
 | `RunULM` | Run ULM (`decoupler.mt.ulm`) for ONE input (one celltype's `PseudoDESeq2` data, or a whole AnnData) against any network (hallmark, progeny, collectri, ...), + optional barplot (pass `ax=` to draw into a shared grid) -- loop over celltypes yourself |
 | `MeltActsPadjToLong` | Combine several celltypes' stored acts/padj tables into one tidy long-format table -- feed straight into `sctools.plots.PlotSignificanceHeatmap` |
 | `BuildSignificantFeatureTable` | Long-format table restricted to significant hits, + category/direction columns (optional category dict with prefix stripping, e.g. `"HALLMARK_"`) |
@@ -247,8 +252,9 @@ PlotAUCellUMAPs(adata)
 ```python
 from sctools.degs import (
     Pseudobulking, PseudoPCA, PseudoFeatSelection, PseudoDESeq2,
-    VolcanoGridByGroup, RunULM, MeltActsPadjToLong,
+    VolcanoGridByGroup,
 )
+from sctools.functionalanalysis import RunULM, MeltActsPadjToLong
 from sctools.plots import PlotSignificanceHeatmap
 
 # 16. Aggregate counts per (celltype, sample); PCA here is optional QC only,
