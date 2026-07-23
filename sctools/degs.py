@@ -479,32 +479,79 @@ def PseudoDESeq2(
 
 def VolcanoGridByGroup(
     df: pd.DataFrame,
-    group_col: str = "celltype",          # era "tissue" no seu docstring; aqui é o agrupador
+    group_col: str = "celltype",
     lfc_thr: float = 1.0,
     p_thr: float = 0.05,
     top_labels: int = 10,
     col_gene: str = "gene_id",
     col_pvalue: str = "padj",
     col_fc: str = "log2FoldChange",
-    n_cols: int = 3,                      # <- você escolhe quantas colunas
-    figsize_per_ax=(4.2, 3.6),            # tamanho por painel
+    n_cols: int = 3,
+    figsize_per_ax=(4.2, 3.6),
     point_size: float = 12,
     alpha: float = 0.75,
     y_quantile: float = 0.995,
     balance_labels: bool = True,
-    sharex: bool = True,                  # True = Todos os subplots terão o mesmo eixo X (mesma escala de log2FC).
-    sharey: bool = False,                 # False =  Cada subplot terá seu próprio eixo Y (-log10 p).
-    save_path: str | None = None,         # salva UMA figura
+    sharex: bool = True,
+    sharey: bool = False,
+    save_path: str | None = None,
     dpi: int = 180,
     return_fig: bool = False
 ):
     """
-    Volcano plots em grid, um painel por grupo (ex: celltype).
+    Volcano plots in a grid, one panel per group (e.g. celltype).
 
     `col_pvalue` defaults to "padj" (multiple-testing-corrected), not raw
     "pvalue" -- using an uncorrected p-value as the default significance
     column for a genome-wide volcano plot would be statistically incorrect.
     Pass `col_pvalue="pvalue"` explicitly if you really want the raw value.
+
+    Parameters
+    ----------
+    df : long-format DE results, e.g. `PseudoDESeq2`'s `results_df` for
+        several celltypes concatenated together with a `group_col` column
+        added (one row per (group, gene)).
+    group_col : str -> column to split into panels, one per unique value
+        (e.g. "celltype").
+    lfc_thr : float -> absolute `col_fc` threshold for calling a gene
+        Up/Down (used together with `p_thr`).
+    p_thr : float -> significance threshold on `col_pvalue` for calling a
+        gene Up/Down; also where the horizontal significance line is drawn.
+    top_labels : int -> max number of significant genes labeled per panel
+        (gene names annotated next to their point).
+    col_gene : str -> column with the gene identifier used as the point
+        label.
+    col_pvalue : str -> column used both for the y-axis (`-log10`) and for
+        the Up/Down/NS significance call.
+    col_fc : str -> column with the log2 fold-change values (x-axis).
+    n_cols : int -> number of columns in the panel grid; row count is
+        derived from the number of groups.
+    figsize_per_ax : tuple -> (width, height) in inches for a single panel;
+        the full figure size is this times (n_cols, n_rows).
+    point_size : float -> scatter point size (`s` in `ax.scatter`).
+    alpha : float -> point transparency for Up/Down points; NS points are
+        always drawn at a fixed, lower alpha (0.5) so they recede visually.
+    y_quantile : float -> quantile of `-log10(col_pvalue)` used to set a
+        robust y-axis upper limit, so that a few extreme points don't
+        compress the rest of the panel.
+    balance_labels : bool -> if True, split `top_labels` evenly between Up
+        and Down genes; if False, take the top `top_labels` by |log2FC|
+        regardless of direction (could end up all Up or all Down).
+    sharex : bool -> share the same x-axis (log2FC) scale/limits across all
+        panels, instead of each panel auto-scaling to its own data.
+    sharey : bool -> share the same y-axis (-log10 p) scale/limits across
+        all panels.
+    save_path : str or None -> if given, save the whole grid figure here
+        (parent directories created automatically). Note: the actual
+        `fig.savefig` call below uses a fixed `dpi=300` for the saved file,
+        independent of the `dpi` parameter (which only sets the on-screen/
+        returned figure's resolution).
+    dpi : int -> resolution of the created `plt.subplots` figure (on-screen
+        or returned via `return_fig`); does not affect the saved-file
+        resolution (see `save_path` note above).
+    return_fig : bool -> if True, return `(fig, axes)` instead of calling
+        `plt.show()`, so the caller can further customize or embed the
+        figure. If False (default), shows the figure and returns None.
     """
 
     df = df.copy()

@@ -69,6 +69,7 @@ from sctools.degs import (
 )
 
 from sctools.functionalanalysis import (
+    PrepareULMInput,
     RunULM,
     MeltActsPadjToLong,
     BuildSignificantFeatureTable,
@@ -140,6 +141,7 @@ __all__ = [
     "PseudoDESeq2",
     "VolcanoGridByGroup",
     # Functional analysis (hallmark/pathway activity, decoupler ULM)
+    "PrepareULMInput",
     "RunULM",
     "MeltActsPadjToLong",
     "BuildSignificantFeatureTable",

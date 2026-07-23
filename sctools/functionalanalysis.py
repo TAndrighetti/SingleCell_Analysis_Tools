@@ -9,7 +9,13 @@ Generic over the network (dc.op.hallmark, dc.op.progeny, dc.op.collectri, or
 any other decoupler net) and its feature naming -- nothing here is specific
 to MSigDB hallmarks.
 
+hallmark = dc.op.hallmark(organism="mouse")
+progeny = dc.op.progeny(organism="mouse")
+collectri = dc.op.collectri(organism="mouse")
+
+
 Typical usage order:
+    PrepareULMInput()              -> optional: build one celltype's ULM input from a long-format DE table (e.g. reloaded from CSV in a separate notebook); skip this if you still have `PseudoDESeq2`'s `data` in memory
     RunULM()                       -> run ULM for ONE input against any net, + optional barplot (pass `ax=` for a grid)
     MeltActsPadjToLong()           -> combine several celltypes' stored acts/padj into one tidy table
     BuildSignificantFeatureTable() -> long-format table restricted to significant hits, + category/direction columns
@@ -28,7 +34,13 @@ celltype); its own `category_map` param takes the same `{category:
 instead of looping internally over a `pdata_by_celltype` dict. Its `data`
 argument is typically `PseudoDESeq2`'s second return value -- that function
 is the boundary between DEGs (`sctools.degs`) and functional analysis
-(this module).
+(this module), when both run in the same session/notebook.
+
+When DEGs and functional analysis run in *separate* notebooks instead (DE
+results reloaded from a long-format CSV rather than kept in memory),
+`PseudoDESeq2`'s `data` no longer exists as an object -- use
+`PrepareULMInput` to rebuild the same 1-row-per-contrast shape from that
+long table, one celltype at a time.
 
 `_BuildFeatureToCategoryMap`'s `prefix` param strips a naming-convention
 prefix (e.g. `prefix="HALLMARK_"` for MSigDB) -- leave it empty for feature
@@ -52,15 +64,54 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "PrepareULMInput",
     "RunULM",
     "MeltActsPadjToLong",
     "BuildSignificantFeatureTable",
     "SummarizeFeatureCategories",
 ]
 
+#####################################################################
+#### ULM Enrichment
+
+
+def PrepareULMInput(
+    long_df: pd.DataFrame,
+    celltype: str,
+    *,
+    celltype_col: str = "celltype",
+    gene_col: str = "gene_id",
+    value_col: str = "stat",
+    contrast_name: str = "KO.vs.WT",
+) -> pd.DataFrame:
+    """
+    Build one celltype's 1-row ULM input matrix from a long-format DE table.
+
+    Rebuilds the same shape `PseudoDESeq2` builds in memory (`data`), for
+    when DEGs and functional analysis run in separate notebooks and the DE
+    results were reloaded from a long-format CSV (one row per
+    (celltype, gene)) instead.
+
+    `value_col` defaults to "stat" -- PyDESeq2's Wald statistic, the same
+    column `sctools.degs.PseudoDESeq2` itself uses to build its `data`
+    return value. Pass a different `value_col` if your long table's effect
+    size comes from elsewhere (e.g. a different DE method/column).
+    """
+    sub = long_df[long_df[celltype_col] == celltype]
+
+    if sub.empty:
+        raise ValueError(
+            f"celltype='{celltype}' not found in long_df['{celltype_col}']. "
+            f"Available: {sorted(long_df[celltype_col].unique())}."
+        )
+
+    sub = sub.set_index(gene_col)
+
+    return sub[[value_col]].T.rename(index={value_col: contrast_name})
+
 
 def MeltActsPadjToLong(
-    pdata_by_celltype: dict,
+    source,
     name_df_acts: str,
     name_df_padj: str,
     contrast_name: str,
@@ -71,11 +122,27 @@ def MeltActsPadjToLong(
     table: one row per (celltype, feature), with columns
     [celltype, feature_col, "contrast", "score", "padj"].
 
-    Use this after your own per-celltype loop over `RunULM` has stored
-    `hm_acts`/`hm_padj` into `pdata_by_celltype[celltype][name_df_acts/padj]`,
-    to combine them into one tidy table for
-    `sctools.plots.PlotSignificanceHeatmap`.
+    `source` accepts either:
+    - a `pdata_by_celltype` dict, i.e. `{celltype: {name_df_acts: hm_acts,
+      name_df_padj: hm_padj}}`, built by your own per-celltype loop over
+      `RunULM` (`pdata_by_celltype[celltype][name_df_acts/padj] = hm_acts/hm_padj`).
+    - a single pseudobulk `pdata` AnnData with `pdata.uns[name_df_acts]`/
+      `pdata.uns[name_df_padj]` already holding `{celltype: hm_acts}`/
+      `{celltype: hm_padj}` dicts -- lets acts/padj live on the same object
+      you already have in scope (e.g. when DEGs and functional analysis run
+      in separate notebooks and only `pdata` was reloaded, not a
+      `pdata_by_celltype` dict) instead of a separate loose dict.
     """
+    if hasattr(source, "uns"):
+        acts_by_celltype = source.uns.get(name_df_acts, {})
+        padj_by_celltype = source.uns.get(name_df_padj, {})
+        pdata_by_celltype = {
+            celltype: {name_df_acts: acts_by_celltype.get(celltype), name_df_padj: padj_by_celltype.get(celltype)}
+            for celltype in set(acts_by_celltype) | set(padj_by_celltype)
+        }
+    else:
+        pdata_by_celltype = source
+
     records = []
 
     for celltype, d in pdata_by_celltype.items():
@@ -124,10 +191,12 @@ def RunULM(
     AnnData if you want activities per sample instead of per contrast.
 
     This runs on ONE input; to cover several celltypes, loop over your own
-    `pdata_by_celltype` and call this once per celltype, storing
-    `hm_acts`/`hm_padj` yourself (e.g. `pdata_by_celltype[ct]["hallmark_acts"]
-    = hm_acts`). See `MeltActsPadjToLong` to combine what you stored back
-    into one tidy table for `sctools.plots.PlotSignificanceHeatmap`. Pass
+    celltypes and call this once per celltype, storing `hm_acts`/`hm_padj`
+    yourself -- either in a `pdata_by_celltype` dict (e.g.
+    `pdata_by_celltype[ct]["hallmark_acts"] = hm_acts`) or directly on a
+    single `pdata` AnnData (e.g. `pdata.uns["hallmark_acts"][ct] = hm_acts`).
+    See `MeltActsPadjToLong`, which accepts either, to combine what you
+    stored back into one tidy table for `sctools.plots.PlotSignificanceHeatmap`. Pass
     `ax` (e.g. one panel of your own `plt.subplots` grid) to draw several
     celltypes' barplots into a shared grid figure instead of one figure per
     celltype -- when `ax` is given, `RunULM` only draws into it and sets its
@@ -347,3 +416,5 @@ def SummarizeFeatureCategories(
         summary["fraction_down"] = summary["n_down"] / summary["n_total_features_in_category"]
 
     return summary.sort_values([celltype_col, "dominant_direction", "category"])
+
+#################################################################

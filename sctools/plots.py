@@ -221,20 +221,22 @@ def PlotSignificanceHeatmap(
     if order_y is not None:
         rows = [r for r in order_y if r in value_table.index]
     elif category_map is not None:
-        ordered = [
-            item
-            for items in category_map.values()
-            for item in items
-            if item in value_table.index
-        ]
-        remaining = [r for r in value_table.index if r not in ordered]
-        if sort_by_magnitude:
-            remaining = (
-                value_table.loc[remaining]
+        def _sorted_within(items):
+            items = [item for item in items if item in value_table.index]
+            if not sort_by_magnitude:
+                return items
+            return (
+                value_table.loc[items]
                 .abs().sum(axis=1)
                 .sort_values(ascending=False)
                 .index.tolist()
             )
+
+        ordered = []
+        for items in category_map.values():
+            ordered.extend(_sorted_within(items))
+
+        remaining = _sorted_within([r for r in value_table.index if r not in ordered])
         rows = ordered + remaining
     elif sort_by_magnitude:
         rows = value_table.abs().sum(axis=1).sort_values(ascending=False).index.tolist()
