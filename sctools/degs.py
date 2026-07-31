@@ -714,11 +714,15 @@ def VolcanoGridByGroup(
         for spine in ("top", "right"):
             ax.spines[spine].set_visible(False)
 
+        # com sharex=True o matplotlib esconde os valores do eixo x em todas
+        # as linhas menos a última; força mostrar em todos os painéis
+        ax.tick_params(axis="x", labelbottom=True)
+
         # só coloca rótulos de eixo nas bordas para não poluir
         if i // n_cols == n_rows - 1:
             ax.set_xlabel("log2FC")
         if i % n_cols == 0:
-            ax.set_ylabel(r"$-\log_{10}(p)$")
+            ax.set_ylabel(rf"$-\log_{{10}}$({col_pvalue})")
 
     # esconde axes vazios
     for j in range(n_groups, len(axes)):
