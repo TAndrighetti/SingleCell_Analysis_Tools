@@ -115,10 +115,21 @@ pip install -e .
 
 | Function | Description |
 |---|---|
+| `PrepareULMInput` | Rebuild one celltype's ULM input (1-row stat table) from a long-format DE table -- for when DEGs and functional analysis run in separate notebooks and `PseudoDESeq2`'s `data` isn't in memory anymore |
 | `RunULM` | Run ULM (`decoupler.mt.ulm`) for ONE input (one celltype's `PseudoDESeq2` data, or a whole AnnData) against any network (hallmark, progeny, collectri, ...), + optional barplot (pass `ax=` to draw into a shared grid) -- loop over celltypes yourself |
-| `MeltActsPadjToLong` | Combine several celltypes' stored acts/padj tables into one tidy long-format table -- feed straight into `sctools.plots.PlotSignificanceHeatmap` |
+| `MeltActsPadjToLong` | Combine several celltypes' stored acts/padj tables (dict or `pdata.uns`) into one tidy long-format table -- feed straight into `sctools.plots.PlotSignificanceHeatmap` |
 | `BuildSignificantFeatureTable` | Long-format table restricted to significant hits, + category/direction columns (optional category dict with prefix stripping, e.g. `"HALLMARK_"`) |
 | `SummarizeFeatureCategories` | Per-celltype/category summary (counts, mean score, dominant direction) |
+
+### `sctools.functionalanalysis` — Gene profile correlation (target gene vs all genes, across stages)
+
+| Function | Description |
+|---|---|
+| `SummarizePseudobulkExpression` | log2(CPM+1) + per-sample/gene profile z-score for one or more genes across an ordered stage axis (e.g. maturation) |
+| `PlotPseudobulkExpression` | Mean +/- SD profile plot (expression or z-score) per condition, with individual sample points |
+| `CalculateGeneProfileCorrelations` | Correlate one target gene's stage profile against every other gene, per sample, combined per condition (Fisher z) -- returns an analytic p-value, a permutation p-value, and a per-condition BH-adjusted `padj` |
+| `CalculateGeneCellCorrelations` | Same question, computed from single-cell `adata` instead of pseudobulk `pdata`: correlates using individual cells (all stages mixed) rather than one point per stage. Complement/robustness check for `CalculateGeneProfileCorrelations`, same output schema |
+| `SelectTopCorrelatedGenes` | Filter/rank a `CalculateGeneProfileCorrelations`/`CalculateGeneCellCorrelations` `correlation_table` for one condition (strongest \|rho\|, optionally requiring direction-consistency across samples and/or a `padj` cutoff) |
 
 ## Typical QC workflow
 

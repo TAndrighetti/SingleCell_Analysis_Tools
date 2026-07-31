@@ -74,6 +74,11 @@ from sctools.functionalanalysis import (
     MeltActsPadjToLong,
     BuildSignificantFeatureTable,
     SummarizeFeatureCategories,
+    SummarizePseudobulkExpression,
+    PlotPseudobulkExpression,
+    CalculateGeneProfileCorrelations,
+    CalculateGeneCellCorrelations,
+    SelectTopCorrelatedGenes,
 )
 
 from sctools.qc import (
@@ -146,6 +151,12 @@ __all__ = [
     "MeltActsPadjToLong",
     "BuildSignificantFeatureTable",
     "SummarizeFeatureCategories",
+    # Functional analysis (gene profile correlation across stages)
+    "SummarizePseudobulkExpression",
+    "PlotPseudobulkExpression",
+    "CalculateGeneProfileCorrelations",
+    "CalculateGeneCellCorrelations",
+    "SelectTopCorrelatedGenes",
     # Ambient RNA
     "AmbientRNA",
     # Doublets

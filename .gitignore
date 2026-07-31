@@ -6,6 +6,7 @@ data/
 raw/
 results/
 outputs/
+ignore/
 
 *.h5
 *.h5ad
