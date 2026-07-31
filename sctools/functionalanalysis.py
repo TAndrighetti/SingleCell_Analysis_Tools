@@ -50,16 +50,51 @@ sets with no such prefix (progeny pathways, collectri TFs, ...).
 `compare_condition` half of `contrast_name` (`"{compare_condition}.vs.
 {normal_condition}"`) rather than a hardcoded "KO"/"WT" -- works for any
 two-condition contrast name.
+
+Gene profile correlation (pseudobulk expression of one target gene vs every
+other gene, across an ordered set of stages, e.g. maturation/pseudotime --
+not tied to functional gene sets/networks like the ULM section above, but
+kept here since it's the other kind of "which genes matter" analysis run on
+top of the same pseudobulk `pdata`):
+
+Typical usage order:
+    SummarizePseudobulkExpression()    -> log2(CPM+1) + per-sample/gene profile z-score for one or more genes across an ordered stage axis
+    PlotPseudobulkExpression()         -> mean +/- SD profile plot (or z-score) per condition, with individual sample points
+    CalculateGeneProfileCorrelations() -> correlate one target gene's stage profile against every other gene, per sample, combined per condition (Fisher z), with an analytic and a permutation p-value
+    SelectTopCorrelatedGenes()         -> filter/rank that table's strongest hits for one condition
+
+`CalculateGeneProfileCorrelations` computes its own per-condition BH-adjusted
+`padj` (via the private `_AdjustPValuesBH`) -- independent from any DESeq2/
+ULM significance elsewhere in the package, since this is a different
+statistical test (profile correlation, not differential expression/pathway
+activity).
+
+`CalculateGeneCellCorrelations` answers the same "which genes track my
+target gene" question directly from single-cell `adata` instead of
+pseudobulk `pdata`, correlating using individual cells (mixing all
+maturation stages together within a sample) rather than one point per
+stage. It is a complement/robustness check for `CalculateGeneProfileCorrelations`,
+not a replacement -- run both and compare `correlation_table`s if you want
+to see whether a stage-profile trend also holds cell-to-cell. Shares the
+same Fisher-z combination and output schema (via the same private helpers),
+so `SelectTopCorrelatedGenes` works on its `correlation_table` unchanged.
 """
 
 from __future__ import annotations
 
 import logging
+import warnings
+from collections.abc import Sequence
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from anndata import AnnData
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+from scipy import sparse
+from scipy.stats import norm
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +104,11 @@ __all__ = [
     "MeltActsPadjToLong",
     "BuildSignificantFeatureTable",
     "SummarizeFeatureCategories",
+    "SummarizePseudobulkExpression",
+    "PlotPseudobulkExpression",
+    "CalculateGeneProfileCorrelations",
+    "CalculateGeneCellCorrelations",
+    "SelectTopCorrelatedGenes",
 ]
 
 #####################################################################
@@ -418,3 +458,1107 @@ def SummarizeFeatureCategories(
     return summary.sort_values([celltype_col, "dominant_direction", "category"])
 
 #################################################################
+
+
+#####################################################################
+#### Gene profile correlation (target gene vs all genes, across stages)
+
+
+def _ToDense(matrix) -> np.ndarray:
+    """Convert a sparse or dense matrix into a NumPy array."""
+
+    if sparse.issparse(matrix):
+        return matrix.toarray()
+
+    return np.asarray(matrix)
+
+
+def _ProfileZScore(values: pd.Series) -> pd.Series:
+    """Calculate a z-score across maturation stages."""
+
+    values = values.astype(float)
+    valid = values.notna()
+
+    result = pd.Series(np.nan, index=values.index)
+
+    if valid.sum() < 2:
+        return result
+
+    standard_deviation = values.loc[valid].std(ddof=0)
+
+    if not np.isfinite(standard_deviation) or np.isclose(standard_deviation, 0):
+        return result
+
+    result.loc[valid] = (values.loc[valid] - values.loc[valid].mean()) / standard_deviation
+
+    return result
+
+
+def _AdjustPValuesBH(pvalues: Sequence[float]) -> np.ndarray:
+    """Adjust p-values using the Benjamini-Hochberg method."""
+
+    pvalues = np.asarray(pvalues, dtype=float)
+    adjusted = np.full(len(pvalues), np.nan)
+
+    valid = np.isfinite(pvalues)
+
+    if valid.sum() == 0:
+        return adjusted
+
+    valid_pvalues = pvalues[valid]
+    order = np.argsort(valid_pvalues)
+
+    ordered_pvalues = valid_pvalues[order]
+    n_tests = len(ordered_pvalues)
+
+    ordered_adjusted = ordered_pvalues * n_tests / np.arange(1, n_tests + 1)
+    ordered_adjusted = np.minimum.accumulate(ordered_adjusted[::-1])[::-1]
+    ordered_adjusted = np.clip(ordered_adjusted, 0, 1)
+
+    valid_adjusted = np.empty(n_tests, dtype=float)
+    valid_adjusted[order] = ordered_adjusted
+    adjusted[valid] = valid_adjusted
+
+    return adjusted
+
+
+def SummarizePseudobulkExpression(
+    pdata: AnnData,
+    genes: str | Sequence[str],
+    *,
+    sample_col: str = "sample",
+    stage_col: str = "celltype",
+    condition_col: str = "condition",
+    counts_layer: str = "counts",
+    cell_count_col: str = "psbulk_cells",
+    stage_order: Sequence[str] | None = None,
+    min_cells: int = 20,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Calculate log2(CPM + 1) pseudobulk expression.
+
+    A profile z-score is calculated independently for each biological
+    sample and gene across maturation stages.
+    """
+
+    # Convert one gene name into a list.
+    if isinstance(genes, str):
+        genes = [genes]
+    else:
+        genes = list(genes)
+
+    if not genes:
+        raise ValueError("At least one gene must be provided.")
+
+    # Check requested genes.
+    missing_genes = [gene for gene in genes if gene not in pdata.var_names]
+
+    if missing_genes:
+        raise KeyError(f"Genes not found: {missing_genes}")
+
+    # Check required metadata.
+    required_columns = [sample_col, stage_col, condition_col, cell_count_col]
+
+    missing_columns = [column for column in required_columns if column not in pdata.obs.columns]
+
+    if missing_columns:
+        raise KeyError(f"Columns not found: {missing_columns}")
+
+    if counts_layer not in pdata.layers:
+        raise KeyError(f"Layer {counts_layer!r} was not found.")
+
+    # Copy pseudobulk metadata.
+    metadata = pdata.obs[required_columns].copy()
+    metadata["_row"] = np.arange(pdata.n_obs)
+
+    # Keep and order the requested stages.
+    if stage_order is not None:
+        stage_order = list(stage_order)
+
+        metadata = metadata.loc[metadata[stage_col].isin(stage_order)].copy()
+        metadata[stage_col] = pd.Categorical(metadata[stage_col], categories=stage_order, ordered=True)
+
+    # Check for duplicated pseudobulks.
+    duplicated = metadata.duplicated([sample_col, condition_col, stage_col], keep=False)
+
+    if duplicated.any():
+        raise ValueError(
+            "More than one pseudobulk was found for the same sample, condition and maturation stage."
+        )
+
+    # Select pseudobulk counts.
+    row_positions = metadata["_row"].to_numpy(dtype=int)
+    count_matrix = pdata.layers[counts_layer][row_positions]
+
+    # Calculate library sizes.
+    library_sizes = np.asarray(count_matrix.sum(axis=1)).ravel().astype(float)
+    metadata["library_size"] = library_sizes
+
+    # Mark valid pseudobulks.
+    metadata["included"] = metadata[cell_count_col].ge(min_cells) & metadata["library_size"].gt(0)
+
+    # Extract counts for selected genes.
+    gene_positions = pdata.var_names.get_indexer(genes)
+    gene_counts = _ToDense(count_matrix[:, gene_positions]).astype(float)
+
+    # Calculate CPM.
+    cpm = np.divide(
+        gene_counts,
+        library_sizes[:, None],
+        out=np.full(gene_counts.shape, np.nan, dtype=float),
+        where=library_sizes[:, None] > 0,
+    ) * 1_000_000
+
+    # Transform expression.
+    expression = np.log2(cpm + 1)
+
+    # Create a long-format table.
+    gene_tables = []
+
+    for position, gene in enumerate(genes):
+        gene_table = metadata.copy()
+        gene_table["gene"] = gene
+        gene_table["gene_count"] = gene_counts[:, position]
+        gene_table["cpm"] = cpm[:, position]
+        gene_table["expression"] = expression[:, position]
+        gene_tables.append(gene_table)
+
+    sample_table = pd.concat(gene_tables, ignore_index=True)
+
+    # Remove expression values from invalid pseudobulks.
+    sample_table.loc[~sample_table["included"], ["cpm", "expression"]] = np.nan
+
+    # Calculate one standardized profile per sample and gene.
+    sample_table["profile_zscore"] = (
+        sample_table
+        .groupby([sample_col, condition_col, "gene"], observed=True, sort=False)["expression"]
+        .transform(_ProfileZScore)
+    )
+
+    # Summarize biological samples.
+    summary_table = (
+        sample_table.loc[sample_table["included"]]
+        .groupby([condition_col, stage_col, "gene"], observed=True, sort=False)
+        .agg(
+            n_samples=(sample_col, "nunique"),
+            mean_expression=("expression", "mean"),
+            sd_expression=("expression", "std"),
+            mean_profile_zscore=("profile_zscore", "mean"),
+            sd_profile_zscore=("profile_zscore", "std"),
+            total_cells=(cell_count_col, "sum"),
+        )
+        .reset_index()
+    )
+
+    return sample_table, summary_table
+
+
+def PlotPseudobulkExpression(
+    sample_table: pd.DataFrame,
+    summary_table: pd.DataFrame,
+    *,
+    genes: str | Sequence[str],
+    conditions: str | Sequence[str] | None = None,
+    sample_col: str = "sample",
+    stage_col: str = "celltype",
+    condition_col: str = "condition",
+    stage_order: Sequence[str] | None = None,
+    scale: str = "expression",
+    show_samples: bool = True,
+    palette: dict | None = None,
+    title: str | None = None,
+    out_figure: str | None = None,
+    ax: Axes | None = None,
+) -> tuple[Figure, Axes]:
+    """
+    Plot mean pseudobulk expression with standard-deviation error bars.
+
+    Points represent individual biological samples.
+    """
+
+    # Convert genes into a list.
+    if isinstance(genes, str):
+        genes = [genes]
+    else:
+        genes = list(genes)
+
+    # Select conditions.
+    if conditions is None:
+        conditions = list(pd.unique(summary_table[condition_col]))
+    elif isinstance(conditions, str):
+        conditions = [conditions]
+    else:
+        conditions = list(conditions)
+
+    # Multiple genes are plotted one condition at a time.
+    if len(genes) > 1 and len(conditions) > 1:
+        raise ValueError("Select only one condition when plotting multiple genes.")
+
+    # Define stage order.
+    if stage_order is None:
+        stage_order = list(pd.unique(summary_table[stage_col]))
+    else:
+        stage_order = list(stage_order)
+
+    # Select plotted values.
+    if scale == "expression":
+        sample_value = "expression"
+        mean_value = "mean_expression"
+        sd_value = "sd_expression"
+        ylabel = "log2(CPM + 1)"
+    elif scale == "zscore":
+        sample_value = "profile_zscore"
+        mean_value = "mean_profile_zscore"
+        sd_value = "sd_profile_zscore"
+        ylabel = "Profile z-score"
+    else:
+        raise ValueError("`scale` must be 'expression' or 'zscore'.")
+
+    # Create the figure.
+    if ax is None:
+        figure, ax = plt.subplots(figsize=(7, 5))
+    else:
+        figure = ax.figure
+
+    x_positions = np.arange(len(stage_order))
+    series = [(gene, condition) for gene in genes for condition in conditions]
+
+    # Separate series slightly on the x-axis.
+    if len(series) == 1:
+        offsets = np.array([0.0])
+    else:
+        offsets = np.linspace(-0.08, 0.08, len(series))
+
+    default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    # Color by condition for one gene. Color by gene for multiple genes.
+    color_groups = conditions if len(genes) == 1 else genes
+
+    colors = {
+        group: (
+            palette[group] if palette is not None and group in palette
+            else default_colors[index % len(default_colors)]
+        )
+        for index, group in enumerate(color_groups)
+    }
+
+    # Plot each gene-condition combination.
+    for (gene, condition), offset in zip(series, offsets):
+        sample_mask = (
+            sample_table["gene"].eq(gene)
+            & sample_table[condition_col].eq(condition)
+            & sample_table["included"]
+        )
+        summary_mask = summary_table["gene"].eq(gene) & summary_table[condition_col].eq(condition)
+
+        gene_samples = sample_table.loc[sample_mask]
+        gene_summary = summary_table.loc[summary_mask].set_index(stage_col).reindex(stage_order)
+
+        if gene_summary.empty or gene_summary[mean_value].isna().all():
+            continue
+
+        color_key = condition if len(genes) == 1 else gene
+        color = colors[color_key]
+        label = str(condition) if len(genes) == 1 else gene
+
+        means = gene_summary[mean_value].to_numpy(dtype=float)
+        standard_deviations = gene_summary[sd_value].fillna(0).to_numpy(dtype=float)
+
+        # Plot mean +/- SD.
+        ax.errorbar(
+            x_positions + offset,
+            means,
+            yerr=standard_deviations,
+            color=color,
+            marker="o",
+            linewidth=2,
+            capsize=4,
+            label=label,
+            zorder=3,
+        )
+
+        # Plot individual biological samples.
+        if show_samples:
+            for stage_index, stage in enumerate(stage_order):
+                values = gene_samples.loc[gene_samples[stage_col].eq(stage), sample_value].dropna()
+
+                if values.empty:
+                    continue
+
+                point_offsets = np.linspace(-0.02, 0.02, len(values))
+
+                ax.scatter(
+                    x_positions[stage_index] + offset + point_offsets,
+                    values,
+                    color=color,
+                    s=25,
+                    alpha=0.7,
+                    zorder=4,
+                )
+
+    # Format the plot.
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(stage_order)
+    ax.set_xlabel("Maturation stage")
+    ax.set_ylabel(ylabel)
+
+    if scale == "zscore":
+        ax.axhline(0, color="gray", linewidth=1, alpha=0.5)
+
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.set_axisbelow(True)
+
+    if title is not None:
+        ax.set_title(title)
+
+    if len(series) > 1:
+        ax.legend(frameon=False)
+
+    figure.tight_layout()
+
+    if out_figure is not None:
+        figure.savefig(out_figure, dpi=500, bbox_inches="tight")
+
+    return figure, ax
+
+
+def _CenteredUnitProfiles(
+    expression: np.ndarray, target_position: int
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+    """
+    Center each gene's profile and rescale it to unit length.
+
+    Their dot product is then equivalent to a Pearson correlation. Returns
+    `target_unit=None` when the target gene's profile has no variance in
+    this profile (e.g. a single sample, all identical values).
+    """
+
+    centered_genes = expression - expression.mean(axis=0)
+    gene_norms = np.sqrt(np.sum(centered_genes**2, axis=0))
+
+    gene_units = np.divide(
+        centered_genes,
+        gene_norms[None, :],
+        out=np.zeros_like(centered_genes, dtype=float),
+        where=gene_norms[None, :] > 0,
+    )
+
+    target_values = expression[:, target_position]
+    centered_target = target_values - target_values.mean()
+    target_norm = np.sqrt(np.sum(centered_target**2))
+
+    if not np.isfinite(target_norm) or np.isclose(target_norm, 0):
+        return None, gene_units, gene_norms
+
+    target_unit = centered_target / target_norm
+
+    return target_unit, gene_units, gene_norms
+
+
+def _CombineFisherZ(
+    rho_matrix: np.ndarray,
+    valid_matrix: np.ndarray,
+    weights: np.ndarray,
+    n_vars: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Combine per-sample correlations into one Fisher-z-weighted profile per gene.
+
+    Returns `(combined_rho, combined_z, weight_sum, pvalues)`, the last being
+    an approximate two-sided p-value from the combined Fisher z.
+    """
+
+    clipped_rho = np.clip(rho_matrix, -0.999999, 0.999999)
+    fisher_z = np.arctanh(clipped_rho)
+
+    weight_matrix = valid_matrix * weights[:, None]
+    weight_sum = weight_matrix.sum(axis=0)
+
+    combined_z = np.divide(
+        np.sum(np.where(valid_matrix, fisher_z * weights[:, None], 0), axis=0),
+        weight_sum,
+        out=np.full(n_vars, np.nan),
+        where=weight_sum > 0,
+    )
+
+    combined_rho = np.tanh(combined_z)
+
+    standard_error = np.divide(
+        1, np.sqrt(weight_sum),
+        out=np.full(n_vars, np.nan),
+        where=weight_sum > 0,
+    )
+
+    z_statistic = np.divide(
+        combined_z, standard_error,
+        out=np.full(n_vars, np.nan),
+        where=standard_error > 0,
+    )
+
+    pvalues = 2 * norm.sf(np.abs(z_statistic))
+
+    return combined_rho, combined_z, weight_sum, pvalues
+
+
+def _PermutationPValues(
+    samples: list[dict],
+    keep_positions: np.ndarray,
+    combined_rho: np.ndarray,
+    weight_sum: np.ndarray,
+    n_permutations: int,
+    permutation_batch_size: int,
+    rng: np.random.Generator,
+    n_vars: int,
+    unit_key: str = "n_stages",
+) -> np.ndarray:
+    """
+    Calculate empirical two-sided permutation p-values for the kept genes.
+
+    Independently permutes the target-gene profile's unit order (e.g. stages,
+    or cells) within each sample, `unit_key` naming which key in `samples`
+    holds that sample's profile length.
+    """
+
+    permutation_pvalues = np.full(n_vars, np.nan)
+
+    if n_permutations <= 0 or len(keep_positions) == 0:
+        return permutation_pvalues
+
+    observed_absolute = np.abs(combined_rho[keep_positions])
+    extreme_counts = np.zeros(len(keep_positions), dtype=int)
+    keep_weight_sum = weight_sum[keep_positions]
+
+    completed = 0
+
+    while completed < n_permutations:
+        current_batch = min(permutation_batch_size, n_permutations - completed)
+
+        permutation_z_sum = np.zeros((current_batch, len(keep_positions)), dtype=float)
+
+        for sample in samples:
+            n_units = sample[unit_key]
+
+            # Generate independent random permutations of the profile order.
+            permutation_indices = np.argsort(
+                rng.random((current_batch, n_units)), axis=1
+            )
+
+            permuted_target = sample["target_unit"][permutation_indices]
+            permuted_rho = permuted_target @ sample["gene_units"][:, keep_positions]
+
+            sample_valid = sample["valid"][keep_positions]
+
+            if not sample_valid.any():
+                continue
+
+            permutation_z_sum[:, sample_valid] += sample["weight"] * np.arctanh(
+                np.clip(permuted_rho[:, sample_valid], -0.999999, 0.999999)
+            )
+
+        permutation_combined_rho = np.tanh(permutation_z_sum / keep_weight_sum[None, :])
+
+        extreme_counts += np.sum(
+            np.abs(permutation_combined_rho) >= observed_absolute[None, :], axis=0
+        )
+
+        completed += current_batch
+
+    permutation_pvalues[keep_positions] = (extreme_counts + 1) / (n_permutations + 1)
+
+    return permutation_pvalues
+
+
+def CalculateGeneProfileCorrelations(
+    pdata: AnnData,
+    target_gene: str,
+    *,
+    sample_col: str = "sample",
+    stage_col: str = "celltype",
+    condition_col: str = "condition",
+    counts_layer: str = "counts",
+    cell_count_col: str = "psbulk_cells",
+    stage_order: Sequence[str] | None = None,
+    min_cells: int = 20,
+    min_cpm: float = 1,
+    min_detected_stages: int = 3,
+    min_stages: int = 4,
+    min_samples: int = 2,
+    method: str = "pearson",
+    n_permutations: int = 2000,
+    permutation_batch_size: int = 100,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Correlate one target gene against all detected genes.
+
+    Correlations are calculated independently in each biological sample
+    across maturation stages.
+
+    Sample correlations are combined within each condition using Fisher's z
+    transformation.
+
+    The returned p-values are:
+
+    pvalue
+        Approximate two-sided p-value based on the combined Fisher z.
+
+    padj
+        Benjamini-Hochberg adjusted p-value within each condition.
+
+    permutation_pvalue
+        Empirical two-sided p-value obtained by independently permuting the
+        target-gene stage order in each biological sample.
+    """
+
+    if method not in {"pearson", "spearman"}:
+        raise ValueError("`method` must be 'pearson' or 'spearman'.")
+
+    if n_permutations < 0:
+        raise ValueError("`n_permutations` cannot be negative.")
+
+    if target_gene not in pdata.var_names:
+        raise KeyError(f"{target_gene!r} was not found.")
+
+    if counts_layer not in pdata.layers:
+        raise KeyError(f"Layer {counts_layer!r} was not found.")
+
+    required_columns = [sample_col, stage_col, condition_col, cell_count_col]
+    missing_columns = [column for column in required_columns if column not in pdata.obs.columns]
+
+    if missing_columns:
+        raise KeyError(f"Columns not found: {missing_columns}")
+
+    # Copy metadata.
+    metadata = pdata.obs[required_columns].copy()
+    metadata["_row"] = np.arange(pdata.n_obs)
+
+    # Keep selected stages.
+    if stage_order is not None:
+        stage_order = list(stage_order)
+
+        metadata = metadata.loc[metadata[stage_col].isin(stage_order)].copy()
+        metadata[stage_col] = pd.Categorical(metadata[stage_col], categories=stage_order, ordered=True)
+
+    # Check duplicated pseudobulks.
+    duplicated = metadata.duplicated([sample_col, condition_col, stage_col], keep=False)
+
+    if duplicated.any():
+        raise ValueError(
+            "More than one pseudobulk was found for the same sample, condition and maturation stage."
+        )
+
+    count_matrix = pdata.layers[counts_layer]
+
+    # Calculate library size for every pseudobulk.
+    library_sizes = np.asarray(count_matrix.sum(axis=1)).ravel().astype(float)
+    row_positions = metadata["_row"].to_numpy(dtype=int)
+    metadata["library_size"] = library_sizes[row_positions]
+
+    # Keep valid pseudobulks.
+    metadata = metadata.loc[
+        metadata[cell_count_col].ge(min_cells) & metadata["library_size"].gt(0)
+    ].copy()
+
+    target_position = pdata.var_names.get_loc(target_gene)
+    gene_names = np.asarray(pdata.var_names)
+    rng = np.random.default_rng(random_state)
+
+    sample_tables = []
+    condition_tables = []
+
+    # Analyze each condition independently.
+    for condition, condition_data in metadata.groupby(condition_col, observed=True, sort=False):
+        samples = []
+
+        # Calculate one correlation profile per biological sample.
+        for sample, sample_data in condition_data.groupby(sample_col, observed=True, sort=False):
+            if stage_order is not None:
+                sample_data = (
+                    sample_data.set_index(stage_col).reindex(stage_order)
+                    .dropna(subset=["_row"]).reset_index()
+                )
+            else:
+                sample_data = sample_data.sort_values(stage_col)
+
+            rows = sample_data["_row"].to_numpy(dtype=int)
+
+            if len(rows) < min_stages:
+                continue
+
+            # Extract pseudobulk counts.
+            sample_counts = _ToDense(count_matrix[rows]).astype(float)
+            sample_library_sizes = library_sizes[rows]
+
+            # Calculate CPM.
+            sample_cpm = np.divide(
+                sample_counts,
+                sample_library_sizes[:, None],
+                out=np.zeros_like(sample_counts, dtype=float),
+                where=(sample_library_sizes[:, None] > 0),
+            ) * 1_000_000
+
+            # Calculate log2(CPM + 1).
+            sample_expression = np.log2(sample_cpm + 1)
+
+            # Check target-gene detection.
+            target_detected_stages = (sample_cpm[:, target_position] >= min_cpm).sum()
+
+            if target_detected_stages < min_detected_stages:
+                continue
+
+            # Convert values into ranks for Spearman.
+            if method == "spearman":
+                correlation_expression = (
+                    pd.DataFrame(sample_expression).rank(axis=0, method="average").to_numpy()
+                )
+            else:
+                correlation_expression = sample_expression
+
+            # Center and unit-normalize every gene's profile.
+            target_unit, gene_units, gene_norms = _CenteredUnitProfiles(
+                correlation_expression, target_position
+            )
+
+            if target_unit is None:
+                continue
+
+            # Correlate target against every gene.
+            correlations = target_unit @ gene_units
+
+            # Require gene detection in enough stages.
+            detected_genes = (sample_cpm >= min_cpm).sum(axis=0) >= min_detected_stages
+            valid_genes = detected_genes & (gene_norms > 0) & np.isfinite(correlations)
+
+            # Exclude the target itself.
+            valid_genes[target_position] = False
+            valid_positions = np.flatnonzero(valid_genes)
+
+            sample_table = pd.DataFrame({
+                "condition": condition,
+                "sample": sample,
+                "gene": gene_names[valid_positions],
+                "rho": correlations[valid_positions],
+                "n_stages": len(rows),
+            })
+
+            sample_tables.append(sample_table)
+
+            samples.append({
+                "sample": sample,
+                "rho": correlations,
+                "valid": valid_genes,
+                "n_stages": len(rows),
+                "weight": len(rows) - 3,
+                "target_unit": target_unit,
+                "gene_units": gene_units,
+            })
+
+        if len(samples) < min_samples:
+            warnings.warn(
+                f"Condition {condition!r} did not have enough valid samples for "
+                f"{target_gene!r} correlations."
+            )
+            continue
+
+        # Collect sample-level correlations.
+        rho_matrix = np.vstack([sample["rho"] for sample in samples])
+        valid_matrix = np.vstack([sample["valid"] for sample in samples])
+        weights = np.asarray([sample["weight"] for sample in samples], dtype=float)
+
+        valid_sample_count = valid_matrix.sum(axis=0)
+        keep_genes = valid_sample_count >= min_samples
+        keep_positions = np.flatnonzero(keep_genes)
+
+        if len(keep_positions) == 0:
+            continue
+
+        # Fisher-z transformation.
+        combined_rho, _, weight_sum, pvalues = _CombineFisherZ(
+            rho_matrix, valid_matrix, weights, pdata.n_vars
+        )
+
+        # Calculate empirical permutation p-values.
+        permutation_pvalues = _PermutationPValues(
+            samples, keep_positions, combined_rho, weight_sum,
+            n_permutations, permutation_batch_size, rng, pdata.n_vars,
+            unit_key="n_stages",
+        )
+
+        # Sample-level descriptive statistics.
+        rho_valid = np.where(valid_matrix, rho_matrix, np.nan)
+
+        mean_rho = np.nanmean(rho_valid, axis=0)
+        min_rho = np.nanmin(rho_valid, axis=0)
+        max_rho = np.nanmax(rho_valid, axis=0)
+        min_abs_rho = np.nanmin(np.abs(rho_valid), axis=0)
+
+        all_positive = np.all(np.where(valid_matrix, rho_matrix > 0, True), axis=0)
+        all_negative = np.all(np.where(valid_matrix, rho_matrix < 0, True), axis=0)
+        direction_consistent = all_positive | all_negative
+
+        condition_table = pd.DataFrame({
+            "condition": condition,
+            "gene": gene_names[keep_positions],
+            "n_samples": valid_sample_count[keep_positions],
+            "combined_rho": combined_rho[keep_positions],
+            "mean_rho": mean_rho[keep_positions],
+            "min_rho": min_rho[keep_positions],
+            "max_rho": max_rho[keep_positions],
+            "min_abs_rho": min_abs_rho[keep_positions],
+            "direction_consistent": direction_consistent[keep_positions],
+            "pvalue": pvalues[keep_positions],
+            "permutation_pvalue": permutation_pvalues[keep_positions],
+        })
+
+        condition_tables.append(condition_table)
+
+    if not sample_tables:
+        raise ValueError("No valid sample-level correlations were calculated.")
+
+    if not condition_tables:
+        raise ValueError("No condition had enough valid correlations.")
+
+    sample_correlations = pd.concat(sample_tables, ignore_index=True)
+    correlation_table = pd.concat(condition_tables, ignore_index=True)
+
+    # Adjust p-values independently in each condition.
+    correlation_table["padj"] = (
+        correlation_table.groupby("condition", observed=True)["pvalue"].transform(_AdjustPValuesBH)
+    )
+
+    correlation_table["abs_rho"] = correlation_table["combined_rho"].abs()
+    correlation_table["direction"] = np.where(correlation_table["combined_rho"] >= 0, "positive", "negative")
+
+    # Rank consistent and stronger correlations first.
+    correlation_table = correlation_table.sort_values(
+        ["condition", "direction_consistent", "abs_rho"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
+
+    return sample_correlations, correlation_table
+
+
+def CalculateGeneCellCorrelations(
+    adata: AnnData,
+    target_gene: str,
+    *,
+    sample_col: str = "sample",
+    condition_col: str = "condition",
+    stage_col: str | None = "celltype",
+    stages: Sequence[str] | None = None,
+    counts_layer: str = "counts",
+    min_cells: int = 200,
+    min_cpm: float = 1,
+    min_detected_cells: int = 20,
+    min_samples: int = 2,
+    method: str = "pearson",
+    n_permutations: int = 0,
+    permutation_batch_size: int = 20,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Correlate one target gene against all detected genes, using individual
+    cells (not stage-level pseudobulk) as the unit of observation.
+
+    Correlations are calculated independently in each biological sample,
+    mixing all of that sample's cells together regardless of maturation
+    stage. This is a complement to `CalculateGeneProfileCorrelations`, not a
+    replacement for it: a check for whether a stage-profile correlation also
+    holds when cell-to-cell variation is not first collapsed into per-stage
+    pseudobulk averages. `stage_col`/`stages` only optionally restrict which
+    cells are included (e.g. dropping an unannotated group) -- unlike the
+    pseudobulk version, stage is not an axis here, so there is no
+    `stage_order` to reindex.
+
+    Sample correlations are combined within each condition using Fisher's z
+    transformation, exactly as in `CalculateGeneProfileCorrelations`.
+
+    Genes are pre-filtered once (by detection across all included cells,
+    pooled) before anything is densified, so the per-sample expression
+    matrices only ever cover the reduced candidate gene set, not all of
+    `adata.var_names` -- individual cells vastly outnumber pseudobulk
+    stages, so densifying every gene up front would be wasteful.
+
+    `n_permutations` defaults to 0 (skipped): with thousands of cells per
+    sample, the analytic Fisher-z p-value is already well behaved, and a
+    permutation test that reshuffles cell order for every kept gene scales
+    with `n_cells x n_genes_kept x n_permutations`, which gets expensive
+    fast at this resolution. Pass `n_permutations > 0` only if you
+    specifically want it.
+
+    See `CalculateGeneProfileCorrelations` for what `pvalue`/`padj`/
+    `permutation_pvalue` mean -- identical here.
+    """
+
+    if method not in {"pearson", "spearman"}:
+        raise ValueError("`method` must be 'pearson' or 'spearman'.")
+
+    if n_permutations < 0:
+        raise ValueError("`n_permutations` cannot be negative.")
+
+    if stages is not None and stage_col is None:
+        raise ValueError("`stage_col` must be set to use `stages`.")
+
+    if target_gene not in adata.var_names:
+        raise KeyError(f"{target_gene!r} was not found.")
+
+    if counts_layer not in adata.layers:
+        raise KeyError(f"Layer {counts_layer!r} was not found.")
+
+    required_columns = [sample_col, condition_col]
+
+    if stage_col is not None:
+        required_columns.append(stage_col)
+
+    missing_columns = [column for column in required_columns if column not in adata.obs.columns]
+
+    if missing_columns:
+        raise KeyError(f"Columns not found: {missing_columns}")
+
+    # Copy metadata.
+    metadata = adata.obs[required_columns].copy()
+    metadata["_row"] = np.arange(adata.n_obs)
+
+    # Optionally restrict to a subset of stages/celltypes (not an axis here).
+    if stages is not None:
+        metadata = metadata.loc[metadata[stage_col].isin(list(stages))].copy()
+
+    count_matrix = adata.layers[counts_layer]
+    target_position = adata.var_names.get_loc(target_gene)
+    gene_names = np.asarray(adata.var_names)
+    n_genes = adata.n_vars
+    rng = np.random.default_rng(random_state)
+
+    # Pre-filter genes once, pooling every included cell, so the per-sample
+    # loop below only ever densifies this reduced candidate set. Only the
+    # sparse matrix's nonzero entries are touched (no dense n_cells x n_genes
+    # matrix is built here).
+    prefilter_rows = metadata["_row"].to_numpy(dtype=int)
+    prefilter_counts = count_matrix[prefilter_rows]
+
+    if not sparse.issparse(prefilter_counts):
+        prefilter_counts = sparse.csr_matrix(prefilter_counts)
+
+    prefilter_library_sizes = np.asarray(prefilter_counts.sum(axis=1)).ravel().astype(float)
+    prefilter_valid_cells = prefilter_library_sizes > 0
+
+    prefilter_counts = prefilter_counts[prefilter_valid_cells]
+    prefilter_library_sizes = prefilter_library_sizes[prefilter_valid_cells]
+
+    prefilter_threshold = min_cpm * prefilter_library_sizes / 1_000_000
+    prefilter_coo = prefilter_counts.tocoo()
+    prefilter_detected = prefilter_coo.data >= prefilter_threshold[prefilter_coo.row]
+    detected_counts = np.bincount(prefilter_coo.col[prefilter_detected], minlength=n_genes)
+
+    candidate_columns = np.flatnonzero(detected_counts >= min_detected_cells)
+
+    if target_position not in candidate_columns:
+        candidate_columns = np.sort(np.append(candidate_columns, target_position))
+
+    target_local_position = int(np.searchsorted(candidate_columns, target_position))
+    gene_names_kept = gene_names[candidate_columns]
+    n_candidate_genes = len(candidate_columns)
+
+    sample_tables = []
+    condition_tables = []
+
+    # Analyze each condition independently.
+    for condition, condition_data in metadata.groupby(condition_col, observed=True, sort=False):
+        samples = []
+
+        # Calculate one correlation profile per biological sample.
+        for sample, sample_data in condition_data.groupby(sample_col, observed=True, sort=False):
+            rows = sample_data["_row"].to_numpy(dtype=int)
+
+            sample_counts_full = count_matrix[rows]
+
+            if not sparse.issparse(sample_counts_full):
+                sample_counts_full = sparse.csr_matrix(sample_counts_full)
+
+            # Library size uses every gene, not just the candidate subset,
+            # so CPM stays a true per-cell rate.
+            library_sizes = np.asarray(sample_counts_full.sum(axis=1)).ravel().astype(float)
+            valid_cells = library_sizes > 0
+
+            if valid_cells.sum() < min_cells:
+                continue
+
+            library_sizes = library_sizes[valid_cells]
+            sample_counts = _ToDense(
+                sample_counts_full[valid_cells][:, candidate_columns]
+            ).astype(float)
+
+            # Calculate CPM.
+            sample_cpm = np.divide(
+                sample_counts,
+                library_sizes[:, None],
+                out=np.zeros_like(sample_counts, dtype=float),
+                where=(library_sizes[:, None] > 0),
+            ) * 1_000_000
+
+            # Calculate log2(CPM + 1).
+            sample_expression = np.log2(sample_cpm + 1)
+
+            # Check target-gene detection within this sample.
+            target_detected_cells = (sample_cpm[:, target_local_position] >= min_cpm).sum()
+
+            if target_detected_cells < min_detected_cells:
+                continue
+
+            # Convert values into ranks for Spearman.
+            if method == "spearman":
+                correlation_expression = (
+                    pd.DataFrame(sample_expression).rank(axis=0, method="average").to_numpy()
+                )
+            else:
+                correlation_expression = sample_expression
+
+            # Center and unit-normalize every gene's profile.
+            target_unit, gene_units, gene_norms = _CenteredUnitProfiles(
+                correlation_expression, target_local_position
+            )
+
+            if target_unit is None:
+                continue
+
+            # Correlate target against every gene.
+            correlations = target_unit @ gene_units
+
+            # Require gene detection in enough cells.
+            detected_genes = (sample_cpm >= min_cpm).sum(axis=0) >= min_detected_cells
+            valid_genes = detected_genes & (gene_norms > 0) & np.isfinite(correlations)
+
+            # Exclude the target itself.
+            valid_genes[target_local_position] = False
+            valid_positions = np.flatnonzero(valid_genes)
+
+            n_sample_cells = int(valid_cells.sum())
+
+            sample_table = pd.DataFrame({
+                "condition": condition,
+                "sample": sample,
+                "gene": gene_names_kept[valid_positions],
+                "rho": correlations[valid_positions],
+                "n_cells": n_sample_cells,
+            })
+
+            sample_tables.append(sample_table)
+
+            samples.append({
+                "sample": sample,
+                "rho": correlations,
+                "valid": valid_genes,
+                "n_cells": n_sample_cells,
+                "weight": n_sample_cells - 3,
+                "target_unit": target_unit,
+                "gene_units": gene_units,
+            })
+
+        if len(samples) < min_samples:
+            warnings.warn(
+                f"Condition {condition!r} did not have enough valid samples for "
+                f"{target_gene!r} cell-level correlations."
+            )
+            continue
+
+        # Collect sample-level correlations.
+        rho_matrix = np.vstack([sample["rho"] for sample in samples])
+        valid_matrix = np.vstack([sample["valid"] for sample in samples])
+        weights = np.asarray([sample["weight"] for sample in samples], dtype=float)
+
+        valid_sample_count = valid_matrix.sum(axis=0)
+        keep_genes = valid_sample_count >= min_samples
+        keep_positions = np.flatnonzero(keep_genes)
+
+        if len(keep_positions) == 0:
+            continue
+
+        # Fisher-z transformation.
+        combined_rho, _, weight_sum, pvalues = _CombineFisherZ(
+            rho_matrix, valid_matrix, weights, n_candidate_genes
+        )
+
+        # Calculate empirical permutation p-values.
+        permutation_pvalues = _PermutationPValues(
+            samples, keep_positions, combined_rho, weight_sum,
+            n_permutations, permutation_batch_size, rng, n_candidate_genes,
+            unit_key="n_cells",
+        )
+
+        # Sample-level descriptive statistics.
+        rho_valid = np.where(valid_matrix, rho_matrix, np.nan)
+
+        mean_rho = np.nanmean(rho_valid, axis=0)
+        min_rho = np.nanmin(rho_valid, axis=0)
+        max_rho = np.nanmax(rho_valid, axis=0)
+        min_abs_rho = np.nanmin(np.abs(rho_valid), axis=0)
+
+        all_positive = np.all(np.where(valid_matrix, rho_matrix > 0, True), axis=0)
+        all_negative = np.all(np.where(valid_matrix, rho_matrix < 0, True), axis=0)
+        direction_consistent = all_positive | all_negative
+
+        condition_table = pd.DataFrame({
+            "condition": condition,
+            "gene": gene_names_kept[keep_positions],
+            "n_samples": valid_sample_count[keep_positions],
+            "combined_rho": combined_rho[keep_positions],
+            "mean_rho": mean_rho[keep_positions],
+            "min_rho": min_rho[keep_positions],
+            "max_rho": max_rho[keep_positions],
+            "min_abs_rho": min_abs_rho[keep_positions],
+            "direction_consistent": direction_consistent[keep_positions],
+            "pvalue": pvalues[keep_positions],
+            "permutation_pvalue": permutation_pvalues[keep_positions],
+        })
+
+        condition_tables.append(condition_table)
+
+    if not sample_tables:
+        raise ValueError("No valid sample-level correlations were calculated.")
+
+    if not condition_tables:
+        raise ValueError("No condition had enough valid correlations.")
+
+    sample_correlations = pd.concat(sample_tables, ignore_index=True)
+    correlation_table = pd.concat(condition_tables, ignore_index=True)
+
+    # Adjust p-values independently in each condition.
+    correlation_table["padj"] = (
+        correlation_table.groupby("condition", observed=True)["pvalue"].transform(_AdjustPValuesBH)
+    )
+
+    correlation_table["abs_rho"] = correlation_table["combined_rho"].abs()
+    correlation_table["direction"] = np.where(correlation_table["combined_rho"] >= 0, "positive", "negative")
+
+    # Rank consistent and stronger correlations first.
+    correlation_table = correlation_table.sort_values(
+        ["condition", "direction_consistent", "abs_rho"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
+
+    return sample_correlations, correlation_table
+
+
+def SelectTopCorrelatedGenes(
+    correlation_table: pd.DataFrame,
+    condition: str,
+    *,
+    n_genes: int = 5,
+    require_consistent: bool = True,
+    max_padj: float | None = None,
+) -> pd.DataFrame:
+    """
+    Select genes with the strongest absolute correlations.
+
+    Positive and negative correlations are both included.
+    """
+
+    result = correlation_table.loc[correlation_table["condition"].eq(condition)].copy()
+
+    if require_consistent:
+        result = result.loc[result["direction_consistent"]]
+
+    if max_padj is not None:
+        result = result.loc[result["padj"] <= max_padj]
+
+    return result.sort_values("abs_rho", ascending=False).head(n_genes).reset_index(drop=True)
