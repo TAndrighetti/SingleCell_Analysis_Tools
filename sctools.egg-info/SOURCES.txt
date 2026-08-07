@@ -4,11 +4,14 @@ sctools/__init__.py
 sctools/alra.py
 sctools/annotation.py
 sctools/degs.py
+sctools/functionalanalysis.py
 sctools/io.py
+sctools/networks.py
 sctools/non_used_functions.py
 sctools/plots.py
 sctools/preprocessing.py
 sctools/qc.py
+sctools/scenic.py
 sctools.egg-info/PKG-INFO
 sctools.egg-info/SOURCES.txt
 sctools.egg-info/dependency_links.txt

@@ -131,6 +131,34 @@ pip install -e .
 | `CalculateGeneCellCorrelations` | Same question, computed from single-cell `adata` instead of pseudobulk `pdata`: correlates using individual cells (all stages mixed) rather than one point per stage. Complement/robustness check for `CalculateGeneProfileCorrelations`, same output schema |
 | `SelectTopCorrelatedGenes` | Filter/rank a `CalculateGeneProfileCorrelations`/`CalculateGeneCellCorrelations` `correlation_table` for one condition (strongest \|rho\|, optionally requiring direction-consistency across samples and/or a `padj` cutoff) |
 
+### `sctools.networks` — Prior-knowledge network filtering (OmniPath)
+
+| Function | Description |
+|---|---|
+| `FilterKnowledgeNetworks` | Filter PPI/TRI edges (OmniPath) to a source gene list x target gene list; same list on both sides for a self-correlated gene network, different lists for directional filtering (e.g. TFs -> DEGs). Returns `source_genesymbol`, `target_genesymbol`, `effect` (stimulation/inhibition/stim-inhib/undefined), `interaction_type` (ppi/tri) |
+
+### `sctools.scenic` — Gene regulatory networks / regulon activity (pySCENIC CLI wrapper)
+
+> Requires an environment with a working `pyscenic` CLI + numpy<1.24 (pySCENIC 0.12.1 uses removed numpy aliases) -- a `scenic_env` conda/Jupyter kernel with numpy==1.23.5 is known to work. `RunScenicGrn`/`RunScenicCtx`/`RunScenicAucell` accept a `pyscenic_path` override.
+
+| Function | Description |
+|---|---|
+| `DownloadScenicResources` | Download the TF list, cisTarget ranking databases (promoter-proximal + extended), and motif annotations for mouse/human (skips files already present) |
+| `ValidateScenicResources` | Sanity-check the download: file existence, TF list readability, and TF/ranking-database gene overlap per database |
+| `PrepareScenicInput` | Build the SCENIC input `AnnData` from a raw-count layer: cell/sample selection, SCENIC's per-gene detection + total-count filter, never mutates the input |
+| `ExportScenicLoom` | Export a prepared `AnnData` to `.loom` (transposed to genes x cells) for the pySCENIC CLI |
+| `RunScenicGrn` | Run `pyscenic grn` (GRNBoost2): candidate TF-target associations from expression alone |
+| `CheckScenicGrn` | Read/validate a GRNBoost2 adjacency table (columns, missing/negative/duplicated values) and print a summary |
+| `RunScenicCtx` | Run `pyscenic ctx` (cisTarget): prune GRNBoost2 modules to those with motif-enrichment support -> `regulons.csv` |
+| `RunScenicAucell` | Run `pyscenic aucell`: per-cell regulon activity score from each cell's gene-expression ranking |
+| `ReadScenicAucell` | Read the cells x regulons AUCell matrix from the output loom, without touching any `AnnData` |
+| `ImportScenicAucell` | Import that matrix into `adata.obsm[key]` (aligned/checked against `adata.obs_names`) + regulon names into `adata.uns["scenic_regulons"]` |
+| `SummarizeScenicActivity` | Per-sample (optionally per condition/celltype/...) mean or median of cell-level AUCell scores -- not pseudobulk, a summary of an already per-cell score |
+| `PlotScenicActivity` | Sample-level jittered scatter + mean/SD per condition, for one regulon (descriptive, no statistical test) |
+| `RunRepeatedScenic` | Re-run GRNBoost2+cisTarget N times with different seeds, one `runs/run_NNN/` folder each -- GRNBoost2 is stochastic, single runs aren't trusted alone |
+| `BuildScenicConsensus` | Consensus regulons/targets across repeated runs (Garner et al. 2023): keep regulons/targets recurring in >80% of runs, regulons need >=5 high-confidence targets |
+| `ExportConsensusRegulons` | Export consensus targets to GMT, for a single final `RunScenicAucell` run using only high-confidence regulons |
+
 ## Typical QC workflow
 
 ```python

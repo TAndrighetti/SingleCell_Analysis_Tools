@@ -11,7 +11,7 @@ license = { text = "MIT" }
 authors = [
     { name = "Tahila Andrighetti", email = "tahilaandrighetti@gmail.com" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 dependencies = [
     "anndata",
     "matplotlib",

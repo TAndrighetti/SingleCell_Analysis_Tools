@@ -24,6 +24,24 @@ if not _sctools_logger.handlers:
 
 from sctools.plots import PlotHeatmap, PlotSignificanceHeatmap
 from sctools.io import CatAdata
+from sctools.networks import FilterKnowledgeNetworks
+from sctools.scenic import (
+    DownloadScenicResources,
+    ValidateScenicResources,
+    PrepareScenicInput,
+    ExportScenicLoom,
+    RunScenicGrn,
+    CheckScenicGrn,
+    RunScenicCtx,
+    RunScenicAucell,
+    ReadScenicAucell,
+    ImportScenicAucell,
+    SummarizeScenicActivity,
+    PlotScenicActivity,
+    RunRepeatedScenic,
+    BuildScenicConsensus,
+    ExportConsensusRegulons,
+)
 from sctools.preprocessing import (
     NormalizeHvgPcaKnn,
     CheckNormalizedLayer,
@@ -105,6 +123,24 @@ from sctools.qc import (
 __all__ = [
     # I/O
     "CatAdata",
+    # Networks
+    "FilterKnowledgeNetworks",
+    # SCENIC (gene regulatory networks / regulon activity)
+    "DownloadScenicResources",
+    "ValidateScenicResources",
+    "PrepareScenicInput",
+    "ExportScenicLoom",
+    "RunScenicGrn",
+    "CheckScenicGrn",
+    "RunScenicCtx",
+    "RunScenicAucell",
+    "ReadScenicAucell",
+    "ImportScenicAucell",
+    "SummarizeScenicActivity",
+    "PlotScenicActivity",
+    "RunRepeatedScenic",
+    "BuildScenicConsensus",
+    "ExportConsensusRegulons",
     # Generic plots
     "PlotHeatmap",
     "PlotSignificanceHeatmap",
