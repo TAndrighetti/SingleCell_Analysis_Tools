@@ -97,6 +97,14 @@ __all__ = [
     "PlotScenicRSSHeatmap",
     "CalculateScenicRSSByCondition",
     "PlotScenicRSSByConditionHeatmap",
+    "CalculateScenicActivityDifference",
+    "SelectTopScenicActivityDifferences",
+    "PlotScenicActivityDifferenceHeatmap",
+    "PlotScenicActivityByConditionHeatmap",
+    "PlotScenicAucellByConditionHeatmap",
+    "CalculateScenicStageVariation",
+    "SelectTopScenicStageVariation",
+    "PlotScenicActivityAcrossStages",
     "BuildReactorInputTables",
     "RunReactorProcessData",
     "RunReactorDifferentialActivityROTS",
@@ -981,93 +989,162 @@ def SummarizeScenicActivity(
     adata,
     *,
     auc_key="X_scenic_auc",
-    sample_key="Sample",
-    group_keys=None,
+    sample_key="sample",
+    condition_key=None,
+    celltype_key=None,
     statistic="mean",
 ):
     """
-    Summarize cell-level AUCell scores by biological sample (and
-    optionally condition/celltype/etc via `group_keys`), because cells
-    from the same sample are not independent replicates.
+    Summarize continuous AUCell regulon activity by biological sample.
 
-    For each (sample, *group_keys) group and each regulon, this is a
-    plain unweighted mean or median of that group's per-cell AUCell
-    scores -- NOT pseudobulk (no raw counts are aggregated here; the
-    per-cell AUCell score is computed first, and only that already-
-    computed score is averaged). `n_cells` is reported per group so
-    small, unstable groups can be spotted, but it isn't used to weight
-    anything.
+    AUCell scores are first calculated independently for each cell by
+    pySCENIC. This function summarizes those continuous scores across
+    cells belonging to the same biological sample and, optionally,
+    experimental condition and cell type.
+
+    Biological samples are kept separately rather than pooling all
+    cells from the same condition. This preserves the biological
+    replicate structure for downstream visualization and comparison.
+
+    No statistical test, scaling, z-score transformation or AUCell
+    binarization is performed here.
 
     Parameters
     ----------
-    adata : must have `auc_key` in `.obsm` (see `ImportScenicAucell`).
-    sample_key : `adata.obs` column identifying the biological sample.
-    group_keys : additional `adata.obs` columns to group by (e.g.
-        condition, celltype) -- summarize separately per combination to
-        avoid mixing activity differences with cell-composition shifts.
-    statistic : "mean" or "median".
+    adata : AnnData
+        AnnData object containing the AUCell matrix in `adata.obsm[auc_key]`.
+
+    auc_key : str
+        Key containing the cells x regulons AUCell matrix.
+
+    sample_key : str
+        Column in `adata.obs` identifying biological samples.
+
+    condition_key : str or None
+        Optional column identifying experimental conditions.
+
+    celltype_key : str or None
+        Optional column identifying cell types or maturation stages.
+
+    statistic : {"mean", "median"}
+        Summary statistic calculated across cells within each group.
+        Default is "mean", matching the average AUCell representation
+        used in downstream SCENIC analyses such as Garner et al. (2023).
 
     Returns
     -------
-    Long-format pd.DataFrame: one row per (sample, *group_keys, regulon),
-    with `n_cells` and `{statistic}_auc` columns.
+    pd.DataFrame
+        Long-format table with one row per
+        sample x condition x celltype x regulon combination.
+
+        The table contains:
+            sample
+            condition (if provided)
+            celltype (if provided)
+            n_cells
+            regulon
+            mean_auc or median_auc
     """
 
     if auc_key not in adata.obsm:
-        raise ValueError(f"'{auc_key}' was not found in adata.obsm.")
+        raise ValueError(
+            f"'{auc_key}' was not found in adata.obsm."
+        )
 
     if sample_key not in adata.obs.columns:
-        raise ValueError(f"'{sample_key}' was not found in adata.obs.")
+        raise ValueError(
+            f"'{sample_key}' was not found in adata.obs."
+        )
 
-    if group_keys is None:
-        group_keys = []
-    group_keys = list(group_keys)
+    if statistic not in {"mean", "median"}:
+        raise ValueError(
+            "`statistic` must be either 'mean' or 'median'."
+        )
 
-    for key in group_keys:
-        if key not in adata.obs.columns:
-            raise ValueError(f"'{key}' was not found in adata.obs.")
+    group_columns = [sample_key]
 
-    if statistic not in ["mean", "median"]:
-        raise ValueError("`statistic` must be either 'mean' or 'median'.")
+    if condition_key is not None:
+        if condition_key not in adata.obs.columns:
+            raise ValueError(
+                f"'{condition_key}' was not found in adata.obs."
+            )
+        group_columns.append(condition_key)
+
+    if celltype_key is not None:
+        if celltype_key not in adata.obs.columns:
+            raise ValueError(
+                f"'{celltype_key}' was not found in adata.obs."
+            )
+        group_columns.append(celltype_key)
 
     auc_data = adata.obsm[auc_key]
 
     if isinstance(auc_data, pd.DataFrame):
         auc_matrix = auc_data.copy()
         auc_matrix.index = adata.obs_names
+
     else:
         if "scenic_regulons" not in adata.uns:
-            raise ValueError("Regulon names were not found in adata.uns['scenic_regulons'].")
+            raise ValueError(
+                "Regulon names were not found in "
+                "adata.uns['scenic_regulons']."
+            )
 
-        regulon_names = adata.uns["scenic_regulons"]
-        auc_matrix = pd.DataFrame(np.asarray(auc_data), index=adata.obs_names, columns=regulon_names)
+        auc_matrix = pd.DataFrame(
+            np.asarray(auc_data),
+            index=adata.obs_names,
+            columns=adata.uns["scenic_regulons"],
+        )
 
-    metadata_columns = [sample_key] + group_keys
-    metadata = adata.obs[metadata_columns].copy()
+    metadata = adata.obs[group_columns].copy()
 
     activity_table = metadata.join(auc_matrix)
 
-    cell_counts = (
-        activity_table.groupby(metadata_columns, observed=True).size().rename("n_cells")
+    grouped = activity_table.groupby(
+        group_columns,
+        observed=True,
     )
+
+    # Number of cells contributing to each biological sample x group.
+    cell_counts = grouped.size().rename("n_cells")
 
     regulon_columns = list(auc_matrix.columns)
 
-    grouped_activity = activity_table.groupby(metadata_columns, observed=True)[regulon_columns]
+    if statistic == "mean":
+        summary = grouped[regulon_columns].mean()
+    else:
+        summary = grouped[regulon_columns].median()
 
-    summary = grouped_activity.mean() if statistic == "mean" else grouped_activity.median()
-    summary = summary.join(cell_counts).reset_index()
-
-    summary_long = summary.melt(
-        id_vars=metadata_columns + ["n_cells"],
-        value_vars=regulon_columns,
-        var_name="regulon",
-        value_name=f"{statistic}_auc",
+    summary = (
+        summary
+        .join(cell_counts)
+        .reset_index()
     )
 
-    print(f"Biological samples: {summary_long[sample_key].nunique()}")
-    print(f"Regulons summarized: {summary_long['regulon'].nunique()}")
-    print(f"Groups summarized: {summary[metadata_columns].drop_duplicates().shape[0]}")
+    value_column = f"{statistic}_auc"
+
+    summary_long = summary.melt(
+        id_vars=group_columns + ["n_cells"],
+        value_vars=regulon_columns,
+        var_name="regulon",
+        value_name=value_column,
+    )
+
+    print(
+        f"Biological samples: "
+        f"{summary_long[sample_key].nunique()}"
+    )
+
+    if celltype_key is not None:
+        print(
+            f"Cell types: "
+            f"{summary_long[celltype_key].nunique()}"
+        )
+
+    print(
+        f"Regulons: "
+        f"{summary_long['regulon'].nunique()}"
+    )
 
     return summary_long
 
@@ -1579,6 +1656,151 @@ def CalculateScenicRSSByCondition(
     return rss_by_condition
 
 
+def _PlotByConditionHeatmap(
+    long_data,
+    *,
+    x_col,
+    y_col,
+    value_col,
+    is_top_col,
+    column_order,
+    row_order,
+    group_size,
+    scale_rows,
+    cmap,
+    center,
+    cbar_label,
+    title,
+    annotate_values=False,
+    annotate_top_only=False,
+    value_fmt="{:.2f}",
+):
+    """
+    Shared renderer behind `PlotScenicRSSByConditionHeatmap` and
+    `PlotScenicActivityDifferenceHeatmap`: pivots `long_data` into a
+    regulon x column heatmap using `sctools.plots.PlotSignificanceHeatmap`'s
+    pivot/annotation machinery (`plot=False`) for the "*" markers, then
+    renders with `seaborn.heatmap`, drawing a black separator line after
+    every `group_size` columns (each celltype's condition block).
+
+    Both callers already reduce their data to one row per (x_col, y_col)
+    pair with a value and an `is_top_col` flag (0 = starred, the
+    `PlotSignificanceHeatmap` `pvalue_col` convention) before calling
+    this -- what differs between an RSS heatmap and a continuous-AUCell
+    difference heatmap is only the value scale (`scale_rows`) and
+    colormap, not the pivot/annotation/separator mechanics, so that part
+    lives here once instead of twice.
+
+    Parameters
+    ----------
+    long_data : one row per (x_col, y_col) combination present in
+        `column_order`/`row_order`.
+    x_col, y_col, value_col, is_top_col : column names in `long_data`.
+    column_order, row_order : explicit, already-deduplicated axis orders.
+    group_size : columns per black-separator group (e.g. 2 for a
+        normal/compare, or reference/test, condition pair per celltype).
+    scale_rows : if True, z-score each row across the displayed columns
+        for display only. Continuous AUCell activity differs in overall
+        magnitude between regulons, so a shared color scale would be
+        dominated by the most active ones; RSS is already a bounded,
+        per-celltype-relative specificity score and doesn't need this.
+    cmap, center : passed to `seaborn.heatmap` (`center=None` for a
+        one-sided scale like RSS, `center=0` for a diverging scale like
+        row z-scored AUCell).
+    cbar_label, title : figure labels.
+    annotate_values : if True, annotate cells with the original (unscaled)
+        `value_table` numbers instead of the default "*" top-flag marker
+        -- the color still follows `display_table` (row-scaled when
+        `scale_rows=True`), so this reads the actual magnitude off cells
+        whose color only encodes the relative pattern.
+    annotate_top_only : with `annotate_values=True`, restrict the numeric
+        annotation to cells where `is_top_col` flags a "top" entry
+        (blank elsewhere) instead of labeling every cell.
+    value_fmt : format string applied to each annotated number.
+
+    Returns
+    -------
+    (fig, ax, value_table, display_table, flag_table, annot_table) :
+    `value_table` is the original (unscaled) pivoted values; `display_table`
+    is what was actually plotted (identical to `value_table` when
+    `scale_rows=False`); `annot_table` is whatever was actually drawn in
+    each cell ("*"/"" or formatted numbers, depending on `annotate_values`).
+    """
+    from sctools.plots import PlotSignificanceHeatmap
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+
+    value_table, flag_table, annot_table = PlotSignificanceHeatmap(
+        long_data,
+        x=x_col,
+        y=y_col,
+        value_col=value_col,
+        pvalue_col=is_top_col,
+        padj_threshold=0.5,
+        order_x=column_order,
+        order_y=row_order,
+        sort_by_magnitude=False,
+        plot=False,
+    )
+
+    if scale_rows:
+        # z-score each regulon's row across the displayed columns, for
+        # display only -- the returned value_table stays on the
+        # original AUCell scale
+        row_mean = value_table.mean(axis=1)
+        row_sd = value_table.std(axis=1)
+        display_table = value_table.sub(row_mean, axis=0).div(row_sd, axis=0)
+        # a regulon with zero variance across the displayed columns has
+        # no defined z-score -- show it as 0 rather than leaving NaN
+        display_table = display_table.fillna(0)
+    else:
+        display_table = value_table
+
+    if annotate_values:
+        # label with the original (unscaled) magnitude, not the z-score
+        # actually driving the color -- a z-score number on its own isn't
+        # biologically interpretable the way the raw value is
+        annot_table = value_table.applymap(
+            lambda v: value_fmt.format(v) if pd.notna(v) else ""
+        )
+        if annotate_top_only:
+            # flag_table follows PlotSignificanceHeatmap's pvalue_col
+            # convention: 0 = "top" -- blank out every non-top cell
+            annot_table = annot_table.where(flag_table == 0, "")
+
+    fig, ax = plt.subplots(
+        figsize=(max(10, 0.5 * len(column_order)), max(6, 0.35 * len(row_order)))
+    )
+
+    sns.heatmap(
+        display_table,
+        ax=ax,
+        cmap=cmap,
+        center=center,
+        cbar_kws={"label": cbar_label},
+        annot=annot_table,
+        fmt="",
+        linewidths=0.4,
+        linecolor="white",
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel(x_col)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+
+    # black separator after every group_size columns. sns.heatmap places
+    # column boundaries at integer positions (0, 1, 2, ...), unlike
+    # imshow's -0.5 offset.
+    for i in range(1, len(column_order) // group_size):
+        ax.axvline(i * group_size, color="black", linewidth=1.5)
+
+    plt.tight_layout()
+    plt.show()
+
+    return fig, ax, value_table, display_table, flag_table, annot_table
+
+
 def PlotScenicRSSByConditionHeatmap(
     rss_by_condition,
     normal_condition,
@@ -1593,9 +1815,10 @@ def PlotScenicRSSByConditionHeatmap(
     celltype at a time: columns are "{celltype} {normal_condition}",
     "{celltype} {compare_condition}" pairs (e.g. "G0 WT", "G0 KO", "G1
     WT", ...), separated by a black vertical line per celltype. Built on
-    `sctools.plots.PlotSignificanceHeatmap`, reusing its pivot/annotation
-    machinery via `plot=False` and rendering the figure here instead, to
-    get control over tick rotation and the celltype separators.
+    the shared `_PlotByConditionHeatmap` renderer, with `scale_rows=False`
+    since RSS is already a bounded, per-celltype-relative specificity
+    score -- see `PlotScenicActivityDifferenceHeatmap` for the
+    continuous-AUCell analog that does need row scaling.
 
     Rows are the union of each celltype's own top-N regulons across both
     conditions, so every celltype x condition column can be compared
@@ -1621,10 +1844,6 @@ def PlotScenicRSSByConditionHeatmap(
     `PlotScenicRSSHeatmap` -- same four objects, now with a
     "celltype_condition" column/axis instead of plain celltype.
     """
-    from sctools.plots import PlotSignificanceHeatmap
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-
     rss_normal = rss_by_condition[normal_condition]
     rss_compare = rss_by_condition[compare_condition]
 
@@ -1673,52 +1892,853 @@ def PlotScenicRSSByConditionHeatmap(
         f"{ct} {cond}" for ct in celltypes for cond in (normal_condition, compare_condition)
     ]
 
-    value_table, flag_table, annot_table = PlotSignificanceHeatmap(
+    _fig, _ax, value_table, _display_table, flag_table, annot_table = _PlotByConditionHeatmap(
         rss_long,
-        x="celltype_condition",
-        y="regulon",
+        x_col="celltype_condition",
+        y_col="regulon",
         value_col="RSS",
-        pvalue_col="is_top_flag",
-        padj_threshold=0.5,
-        order_x=column_order,
-        order_y=top_regulons,
-        sort_by_magnitude=False,
-        plot=False,
-    )
-
-    fig, ax = plt.subplots(
-        figsize=(max(10, 0.5 * len(column_order)), max(6, 0.35 * len(top_regulons)))
-    )
-
-    sns.heatmap(
-        value_table,
-        ax=ax,
+        is_top_col="is_top_flag",
+        column_order=column_order,
+        row_order=top_regulons,
+        group_size=2,
+        scale_rows=False,
         cmap=cmap,
-        cbar_kws={"label": "RSS"},
-        annot=annot_table,
-        fmt="",
-        linewidths=0.4,
-        linecolor="white",
+        center=None,
+        cbar_label="RSS",
+        title=(
+            f"Regulon specificity by celltype x condition "
+            f"(top {top_n} per celltype, * = top {top_n} in that column)"
+        ),
     )
-
-    ax.set_title(
-        f"Regulon specificity by celltype x condition "
-        f"(top {top_n} per celltype, * = top {top_n} in that column)"
-    )
-    ax.set_xlabel("celltype_condition")
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
-    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-
-    # black separator every 2 columns -- marks each celltype's
-    # normal/compare pair. sns.heatmap places column boundaries at
-    # integer positions (0, 1, 2, ...), unlike imshow's -0.5 offset.
-    for i in range(1, len(celltypes)):
-        ax.axvline(i * 2, color="black", linewidth=1.5)
-
-    plt.tight_layout()
-    plt.show()
 
     return value_table, flag_table, annot_table, rss_long
+
+
+def CalculateScenicActivityDifference(
+    scenic_activity,
+    *,
+    condition_key,
+    celltype_key,
+    reference_condition,
+    test_condition,
+    sample_key="sample",
+    value_key="mean_auc",
+):
+    """
+    Calculate the difference in mean continuous AUCell activity between
+    two conditions for each celltype x regulon combination.
+
+    The input must contain sample-level AUCell summaries, typically from
+    `SummarizeScenicActivity()`. Because AUCell was already summarized
+    within each biological sample, condition means are calculated across
+    biological replicates rather than by pooling all cells -- so each
+    biological sample contributes equally to the comparison, independently
+    of how many cells it has.
+
+    The comparison is always:
+        auc_difference = mean(test_condition) - mean(reference_condition)
+
+    Therefore, for KO vs WT:
+        positive values --> higher mean AUCell activity in KO
+        negative values --> higher mean AUCell activity in WT
+
+    This is a descriptive comparison only. No statistical test or
+    multiple-testing correction is performed -- see the REACTOR/ROTS
+    functions above for a statistically tested alternative.
+
+    Parameters
+    ----------
+    scenic_activity : sample-level AUCell summary table (e.g.
+        `SummarizeScenicActivity` output).
+    condition_key : column identifying the experimental condition.
+    celltype_key : column identifying the cell type or maturation stage.
+    reference_condition, test_condition : e.g. "WT", "KO".
+    sample_key : column identifying biological samples.
+    value_key : column containing sample-level AUCell values.
+
+    Returns
+    -------
+    pd.DataFrame : one row per celltype x regulon, with `mean_{reference}`,
+    `mean_{test}` and `auc_difference` columns.
+    """
+    # fail before doing any aggregation if a required column is missing
+    required_columns = {sample_key, condition_key, celltype_key, "regulon", value_key}
+    missing_columns = required_columns.difference(scenic_activity.columns)
+    if missing_columns:
+        raise ValueError(f"Missing columns: {sorted(missing_columns)}")
+
+    if reference_condition == test_condition:
+        raise ValueError("`reference_condition` and `test_condition` must be different.")
+
+    # keep only the two conditions involved in this contrast
+    selected_conditions = {reference_condition, test_condition}
+    activity = scenic_activity.loc[
+        scenic_activity[condition_key].isin(selected_conditions)
+    ].copy()
+
+    found_conditions = set(activity[condition_key].unique())
+    if found_conditions != selected_conditions:
+        raise ValueError(
+            f"Expected conditions {sorted(selected_conditions)}, "
+            f"but found {sorted(found_conditions)}."
+        )
+
+    # scenic_activity already has one AUCell summary per sample x celltype
+    # x regulon -- average those sample-level values within each condition,
+    # giving equal weight to each biological replicate regardless of how
+    # many cells it contributed
+    condition_activity = (
+        activity
+        .groupby([celltype_key, "regulon", condition_key], observed=True)[value_key]
+        .mean()
+        .unstack(condition_key)
+    )
+
+    reference_column = f"mean_{reference_condition}"
+    test_column = f"mean_{test_condition}"
+
+    condition_activity = condition_activity.rename(
+        columns={reference_condition: reference_column, test_condition: test_column}
+    ).reset_index()
+
+    # difference is always test - reference, on the original AUCell
+    # scale (not a fold change)
+    condition_activity["auc_difference"] = (
+        condition_activity[test_column] - condition_activity[reference_column]
+    )
+
+    return condition_activity
+
+
+def SelectTopScenicActivityDifferences(
+    scenic_difference,
+    *,
+    celltype_key,
+    top_n,
+    difference_key="auc_difference",
+):
+    """
+    Select regulons with the largest absolute AUCell activity differences
+    within each cell type or maturation stage.
+
+    Regulons are ranked by |auc_difference|, so both positive and negative
+    changes can be selected. Selection is performed independently within
+    each cell type to ensure that all populations are represented.
+
+    This is a descriptive ranking only and does not represent statistical
+    significance.
+
+    Parameters
+    ----------
+    scenic_difference : `CalculateScenicActivityDifference` output.
+    celltype_key : column identifying cell types or maturation stages.
+    top_n : number of regulons selected per cell type.
+    difference_key : column containing the AUCell difference.
+
+    Returns
+    -------
+    pd.DataFrame : selected celltype x regulon comparisons, ranked by
+    absolute AUCell difference within each cell type.
+    """
+    required_columns = {celltype_key, "regulon", difference_key}
+    missing_columns = required_columns.difference(scenic_difference.columns)
+    if missing_columns:
+        raise ValueError(f"Missing columns: {sorted(missing_columns)}")
+
+    if top_n < 1:
+        raise ValueError("`top_n` must be at least 1.")
+
+    ranked = scenic_difference.copy()
+
+    # absolute difference is used only for ranking: positive and negative
+    # AUCell changes are considered equally when selecting the largest effects
+    ranked["_abs_difference"] = ranked[difference_key].abs()
+
+    top_differences = (
+        ranked
+        .sort_values([celltype_key, "_abs_difference"], ascending=[True, False])
+        .groupby(celltype_key, observed=True)
+        .head(top_n)
+        .drop(columns="_abs_difference")
+        .reset_index(drop=True)
+    )
+
+    return top_differences
+
+
+def PlotScenicActivityDifferenceHeatmap(
+    scenic_difference,
+    selected_differences,
+    *,
+    celltype_key,
+    reference_condition,
+    test_condition,
+    stage_order=None,
+    cmap="vlag",
+    annotate_values=False,
+    annotate_top_only=False,
+    value_fmt="{:.2f}",
+):
+    """
+    Heatmap of row z-scored mean AUCell activity for the regulons
+    selected by `SelectTopScenicActivityDifferences`, across cell
+    types/maturation stages and two experimental conditions -- the
+    continuous-AUCell analog of `PlotScenicRSSByConditionHeatmap`, built
+    on the same shared `_PlotByConditionHeatmap` renderer.
+
+    Columns are "{celltype} {reference_condition}", "{celltype}
+    {test_condition}" pairs (e.g. "G0 WT", "G0 KO", "G1 WT", ...),
+    separated by a black vertical line per celltype, matching the RSS
+    heatmap's layout. By default (`annotate_values=False`), "*" marks a
+    regulon selected as a top AUCell difference for that celltype -- in
+    both its reference and test columns, since
+    `SelectTopScenicActivityDifferences` ranks by |difference| once per
+    celltype, not separately per condition (unlike RSS's own per-column
+    top-N). Set `annotate_values=True` to label cells with the actual
+    mean AUCell number instead (see below).
+
+    Unlike RSS (already a bounded, per-celltype-relative specificity
+    score), raw mean AUCell activity differs in overall magnitude between
+    regulons, so each regulon's row is centered and scaled (z-score)
+    across the displayed columns for display only -- this changes only
+    the color scale, not the returned `mean_auc_table` (always the
+    original AUCell means) or any earlier quantitative comparison
+    (`CalculateScenicActivityDifference`'s `auc_difference` is unscaled).
+
+    Parameters
+    ----------
+    scenic_difference : `CalculateScenicActivityDifference` output.
+    selected_differences : `SelectTopScenicActivityDifferences` output;
+        its regulons get starred, one celltype at a time.
+    celltype_key : column identifying cell types/maturation stages in
+        both input tables.
+    reference_condition, test_condition : e.g. "WT", "KO" -- also fix
+        `mean_{reference_condition}`/`mean_{test_condition}` as the
+        value columns read from `scenic_difference`.
+    stage_order : optional explicit celltype order; celltypes not listed
+        are dropped. Defaults to `scenic_difference[celltype_key]`'s own
+        appearance order.
+    cmap : passed to `seaborn.heatmap`; diverging by default since
+        row-scaled values are centered at 0.
+    annotate_values : if True, label each cell with its original
+        (unscaled) mean AUCell value instead of the "*" top-difference
+        marker -- the color still follows the row z-score, so this reads
+        the actual AUCell magnitude off a cell whose color only encodes
+        the relative pattern.
+    annotate_top_only : with `annotate_values=True`, only label the
+        cells selected as a top AUCell difference for that celltype
+        (blank elsewhere) instead of labeling every cell.
+    value_fmt : format string applied to each annotated number.
+
+    Returns
+    -------
+    (mean_auc_table, scaled_table) : `mean_auc_table` is the original
+    (unscaled) celltype x condition mean AUCell pivot; `scaled_table` is
+    the row z-scored version actually plotted.
+    """
+    reference_col = f"mean_{reference_condition}"
+    test_col = f"mean_{test_condition}"
+
+    required = {celltype_key, "regulon", reference_col, test_col}
+    missing = required.difference(scenic_difference.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {sorted(missing)}")
+
+    if "regulon" not in selected_differences.columns:
+        raise ValueError("`selected_differences` must contain a 'regulon' column.")
+
+    if stage_order is not None:
+        celltypes = [ct for ct in stage_order if ct in set(scenic_difference[celltype_key])]
+    else:
+        celltypes = list(pd.unique(scenic_difference[celltype_key]))
+
+    # a regulon is starred in a given celltype's columns if it was
+    # selected as a top |difference| regulon for THAT celltype --
+    # selection is per-celltype, not per condition, so both the
+    # reference and test column get the same flag
+    selected_per_celltype = {
+        ct: set(selected_differences.loc[selected_differences[celltype_key] == ct, "regulon"])
+        for ct in celltypes
+    }
+
+    # union of every celltype's selected regulons -- one shared regulon
+    # axis so every column is comparable against the same rows, same
+    # convention as PlotScenicRSSByConditionHeatmap
+    row_order = sorted(set(selected_differences["regulon"]))
+
+    conditions = [(reference_condition, reference_col), (test_condition, test_col)]
+
+    records = []
+    for ct in celltypes:
+        ct_data = scenic_difference.loc[scenic_difference[celltype_key] == ct]
+        selected_set = selected_per_celltype[ct]
+        for regulon in row_order:
+            regulon_row = ct_data.loc[ct_data["regulon"] == regulon]
+            if regulon_row.empty:
+                # this regulon was selected as a top difference for a
+                # different celltype and simply wasn't tested in this one
+                continue
+            for condition, value_col in conditions:
+                records.append({
+                    "celltype_condition": f"{ct} {condition}",
+                    "regulon": regulon,
+                    "mean_auc": regulon_row[value_col].iloc[0],
+                    "is_top_flag": 0 if regulon in selected_set else 1,
+                })
+
+    activity_long = pd.DataFrame(records)
+
+    column_order = [f"{ct} {cond}" for ct in celltypes for cond, _ in conditions]
+
+    if annotate_values:
+        title = "Regulon activity across maturation stages (labels = mean AUCell"
+        title += ", top difference only)" if annotate_top_only else ")"
+    else:
+        title = "Regulon activity across maturation stages (* = top AUCell difference for that celltype)"
+
+    _fig, _ax, mean_auc_table, scaled_table, _flag_table, _annot_table = _PlotByConditionHeatmap(
+        activity_long,
+        x_col="celltype_condition",
+        y_col="regulon",
+        value_col="mean_auc",
+        is_top_col="is_top_flag",
+        column_order=column_order,
+        row_order=row_order,
+        group_size=2,
+        scale_rows=True,
+        cmap=cmap,
+        center=0,
+        cbar_label="Row-scaled mean AUCell",
+        title=title,
+        annotate_values=annotate_values,
+        annotate_top_only=annotate_top_only,
+        value_fmt=value_fmt,
+    )
+
+    return mean_auc_table, scaled_table
+
+
+def PlotScenicActivityByConditionHeatmap(
+    scenic_difference,
+    *,
+    reference_condition,
+    test_condition,
+    celltype_key="celltype",
+    top_n=10,
+    stage_order=None,
+    cmap="viridis",
+    annotate_values=True,
+    value_fmt="{:.2f}",
+):
+    """
+    Heatmap of raw mean AUCell activity, one celltype at a time: the
+    top-N regulons for each "{celltype} {condition}" column, ranked by
+    that column's OWN AUCell value -- the continuous-AUCell analog of
+    `PlotScenicRSSByConditionHeatmap`'s per-column top-N convention.
+
+    Unlike `PlotScenicActivityDifferenceHeatmap` (which selects regulons
+    once per celltype by |mean_test - mean_reference|, and needs a
+    `SelectTopScenicActivityDifferences` selection passed in), this
+    selects independently per column and needs nothing beyond
+    `CalculateScenicActivityDifference`'s own output -- e.g. a celltype's
+    WT column can star a different top-10 than its KO column. No row
+    scaling: this shows the plain top-AUCell picture, not a
+    cross-condition comparison.
+
+    Parameters
+    ----------
+    scenic_difference : `CalculateScenicActivityDifference` output.
+    reference_condition, test_condition : e.g. "WT", "KO" -- also fix
+        `mean_{reference_condition}`/`mean_{test_condition}` as the
+        value columns read from `scenic_difference`.
+    celltype_key : column identifying cell types/maturation stages.
+    top_n : regulons kept per column (independently -- not unioned by
+        celltype the way `PlotScenicActivityDifferenceHeatmap` is).
+    stage_order : optional explicit celltype order; celltypes not listed
+        are dropped. Defaults to `scenic_difference[celltype_key]`'s own
+        appearance order.
+    cmap : passed to `seaborn.heatmap`; sequential by default (raw AUCell
+        is non-negative, like RSS -- no need for a diverging scale).
+    annotate_values : label the top-N cells with their raw mean AUCell
+        value (the default -- set False for no annotation at all).
+    value_fmt : format string applied to each annotated number.
+
+    Returns
+    -------
+    (mean_auc_table, full_mean_auc_table) : `mean_auc_table` is the
+    celltype x condition mean AUCell pivot restricted to the plotted
+    top-N regulons (no separate scaled table -- rows aren't scaled
+    here); `full_mean_auc_table` is the same pivot for every regulon in
+    `scenic_difference`, not just the ones that made a column's top-N.
+    """
+    reference_col = f"mean_{reference_condition}"
+    test_col = f"mean_{test_condition}"
+
+    required = {celltype_key, "regulon", reference_col, test_col}
+    missing = required.difference(scenic_difference.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {sorted(missing)}")
+
+    if stage_order is not None:
+        celltypes = [ct for ct in stage_order if ct in set(scenic_difference[celltype_key])]
+    else:
+        celltypes = list(pd.unique(scenic_difference[celltype_key]))
+
+    conditions = [(reference_condition, reference_col), (test_condition, test_col)]
+
+    # top-N regulons for THIS specific celltype+condition column, ranked
+    # by that column's own raw AUCell value -- same idea as RSS's
+    # top_per_column, just on mean AUCell instead of RSS
+    top_per_column = {
+        (ct, condition): set(
+            scenic_difference.loc[scenic_difference[celltype_key] == ct]
+            .nlargest(top_n, value_col)["regulon"]
+        )
+        for ct in celltypes
+        for condition, value_col in conditions
+    }
+
+    # union of every column's own top-N -- one shared regulon axis so
+    # every column is comparable against the same rows
+    top_regulons = sorted(set().union(*top_per_column.values()))
+
+    records = []
+    for ct in celltypes:
+        ct_data = scenic_difference.loc[scenic_difference[celltype_key] == ct]
+        for condition, value_col in conditions:
+            top_set = top_per_column[(ct, condition)]
+            for regulon in top_regulons:
+                regulon_row = ct_data.loc[ct_data["regulon"] == regulon]
+                if regulon_row.empty:
+                    continue
+                records.append({
+                    "celltype_condition": f"{ct} {condition}",
+                    "regulon": regulon,
+                    "mean_auc": regulon_row[value_col].iloc[0],
+                    "is_top_flag": 0 if regulon in top_set else 1,
+                })
+
+    activity_long = pd.DataFrame(records)
+    column_order = [f"{ct} {cond}" for ct in celltypes for cond, _ in conditions]
+
+    _fig, _ax, mean_auc_table, _display_table, _flag_table, _annot_table = _PlotByConditionHeatmap(
+        activity_long,
+        x_col="celltype_condition",
+        y_col="regulon",
+        value_col="mean_auc",
+        is_top_col="is_top_flag",
+        column_order=column_order,
+        row_order=top_regulons,
+        group_size=2,
+        scale_rows=False,
+        cmap=cmap,
+        center=None,
+        cbar_label="Mean AUCell",
+        title=f"Top {top_n} mean AUCell regulons per celltype x condition",
+        annotate_values=annotate_values,
+        annotate_top_only=True,
+        value_fmt=value_fmt,
+    )
+
+    # every regulon's mean AUCell per column, not just the plotted
+    # top-N -- one Series per column, concatenated side by side so a
+    # regulon missing from a given celltype (never tested there) is NaN
+    # in that column rather than dropping the whole row
+    full_parts = [
+        scenic_difference.loc[scenic_difference[celltype_key] == ct]
+        .set_index("regulon")[value_col]
+        .rename(f"{ct} {condition}")
+        for ct in celltypes
+        for condition, value_col in conditions
+    ]
+    full_mean_auc_table = pd.concat(full_parts, axis=1)[column_order]
+
+    return mean_auc_table, full_mean_auc_table
+
+
+def PlotScenicAucellByConditionHeatmap(
+    adata,
+    *,
+    celltype_key,
+    condition_key,
+    normal_condition,
+    compare_condition,
+    auc_key="X_scenic_auc",
+    top_n=10,
+    stage_order=None,
+    cmap="viridis",
+    annotate_values=True,
+    value_fmt="{:.2f}",
+):
+    """
+    Heatmap of raw mean AUCell activity computed directly from
+    `adata.obsm[auc_key]`, pooling all cells within each celltype x
+    condition group -- the no-pipeline version of
+    `PlotScenicActivityByConditionHeatmap`: no `SummarizeScenicActivity`
+    or `CalculateScenicActivityDifference` step needed first, just
+    `adata` + its AUCell matrix.
+
+    Because this pools every cell in a group directly (not the
+    per-sample-then-averaged design `SummarizeScenicActivity` uses), a
+    biological sample with more cells contributes proportionally more to
+    the mean here -- fine for a quick look, but use
+    `PlotScenicActivityByConditionHeatmap` (via `SummarizeScenicActivity`
+    + `CalculateScenicActivityDifference`) instead when biological
+    replicates need equal weight.
+
+    top-N regulons are selected independently per "{celltype}
+    {condition}" column, ranked by that column's own mean AUCell -- same
+    convention as `PlotScenicActivityByConditionHeatmap` and
+    `PlotScenicRSSByConditionHeatmap`.
+
+    Parameters
+    ----------
+    adata : AnnData with `auc_key` in `.obsm` (cells x regulons AUCell,
+        as a DataFrame) and `celltype_key`/`condition_key` in `.obs`.
+    celltype_key, condition_key : `adata.obs` columns.
+    normal_condition, compare_condition : values of `condition_key`;
+        also set column order within each celltype's pair.
+    auc_key : `.obsm` key holding the AUCell matrix.
+    top_n : regulons kept per column.
+    stage_order : optional explicit celltype order; celltypes not listed
+        are dropped. Defaults to `adata.obs[celltype_key]`'s own
+        appearance order.
+    cmap : passed to `seaborn.heatmap`; sequential by default (raw AUCell
+        is non-negative, like RSS).
+    annotate_values : label the top-N cells with their raw mean AUCell
+        value (the default -- set False for no annotation at all).
+    value_fmt : format string applied to each annotated number.
+
+    Returns
+    -------
+    (mean_auc_table, full_mean_auc_table) : `mean_auc_table` is the
+    celltype x condition mean AUCell pivot restricted to the plotted
+    top-N regulons; `full_mean_auc_table` is the same pivot for every
+    regulon in `adata.obsm[auc_key]`, not just the ones that made a
+    column's top-N.
+    """
+    if auc_key not in adata.obsm:
+        raise ValueError(f"'{auc_key}' was not found in adata.obsm.")
+
+    auc_matrix = adata.obsm[auc_key]
+    if not isinstance(auc_matrix, pd.DataFrame):
+        raise ValueError(f"adata.obsm['{auc_key}'] must be a DataFrame of cells x regulons.")
+
+    for key in (celltype_key, condition_key):
+        if key not in adata.obs.columns:
+            raise ValueError(f"'{key}' was not found in adata.obs.")
+
+    metadata = adata.obs[[celltype_key, condition_key]].copy()
+    activity_table = metadata.join(auc_matrix)
+    regulon_columns = list(auc_matrix.columns)
+
+    # pool every cell within each celltype x condition group directly --
+    # no per-sample averaging/equal-replicate-weighting here, unlike
+    # SummarizeScenicActivity + CalculateScenicActivityDifference
+    mean_by_group = activity_table.groupby(
+        [celltype_key, condition_key], observed=True,
+    )[regulon_columns].mean()
+
+    if stage_order is not None:
+        celltypes = [
+            ct for ct in stage_order
+            if ct in set(mean_by_group.index.get_level_values(celltype_key))
+        ]
+    else:
+        celltypes = list(pd.unique(activity_table[celltype_key]))
+
+    conditions = [normal_condition, compare_condition]
+
+    # top-N regulons for THIS specific celltype+condition column, ranked
+    # by that column's own raw mean AUCell
+    top_per_column = {
+        (ct, cond): set(mean_by_group.loc[(ct, cond)].nlargest(top_n).index)
+        for ct in celltypes
+        for cond in conditions
+        if (ct, cond) in mean_by_group.index
+    }
+
+    # union of every column's own top-N -- one shared regulon axis so
+    # every column is comparable against the same rows
+    top_regulons = sorted(set().union(*top_per_column.values()))
+
+    records = []
+    for ct in celltypes:
+        for cond in conditions:
+            if (ct, cond) not in mean_by_group.index:
+                continue
+            top_set = top_per_column[(ct, cond)]
+            row = mean_by_group.loc[(ct, cond)]
+            for regulon in top_regulons:
+                records.append({
+                    "celltype_condition": f"{ct} {cond}",
+                    "regulon": regulon,
+                    "mean_auc": row[regulon],
+                    "is_top_flag": 0 if regulon in top_set else 1,
+                })
+
+    activity_long = pd.DataFrame(records)
+    column_order = [f"{ct} {cond}" for ct in celltypes for cond in conditions]
+
+    _fig, _ax, mean_auc_table, _display_table, _flag_table, _annot_table = _PlotByConditionHeatmap(
+        activity_long,
+        x_col="celltype_condition",
+        y_col="regulon",
+        value_col="mean_auc",
+        is_top_col="is_top_flag",
+        column_order=column_order,
+        row_order=top_regulons,
+        group_size=2,
+        scale_rows=False,
+        cmap=cmap,
+        center=None,
+        cbar_label="Mean AUCell",
+        title=f"Top {top_n} mean AUCell regulons per celltype x condition",
+        annotate_values=annotate_values,
+        annotate_top_only=True,
+        value_fmt=value_fmt,
+    )
+
+    # every regulon's mean AUCell per column, not just the plotted
+    # top-N -- mean_by_group already has every regulon as a column, so
+    # this is just a transpose-and-select rather than a fresh groupby
+    full_parts = [
+        mean_by_group.loc[(ct, cond)].rename(f"{ct} {cond}")
+        for ct in celltypes
+        for cond in conditions
+        if (ct, cond) in mean_by_group.index
+    ]
+    full_mean_auc_table = pd.concat(full_parts, axis=1)[column_order]
+
+    return mean_auc_table, full_mean_auc_table
+
+
+def CalculateScenicStageVariation(
+    scenic_activity,
+    *,
+    condition_key,
+    celltype_key,
+    sample_key="sample",
+    value_key="mean_auc",
+):
+    """
+    Quantify how much each regulon's continuous AUCell activity varies
+    across cell types or maturation stages, separately by condition.
+
+    The input must contain sample-level AUCell summaries from
+    `SummarizeScenicActivity()`. Sample values are first averaged within
+    each condition x stage x regulon. Variation across stages is then
+    summarized using the standard deviation and range.
+
+    This is a descriptive analysis and no statistical test is performed --
+    complementary to `CalculateScenicActivityDifference` (which compares
+    two conditions at a fixed stage): this instead asks how much a
+    regulon's own activity moves across stages, within one condition.
+
+    Parameters
+    ----------
+    scenic_activity : `SummarizeScenicActivity` output.
+    condition_key : column identifying the experimental condition.
+    celltype_key : column identifying cell types or maturation stages.
+    sample_key : column identifying biological samples.
+    value_key : column containing sample-level AUCell values.
+
+    Returns
+    -------
+    pd.DataFrame : one row per condition x regulon with `stage_sd`,
+    `stage_range` and `n_stages`, ranked by decreasing `stage_sd`.
+    """
+    # columns required to reconstruct sample-level stage profiles
+    required = {sample_key, condition_key, celltype_key, "regulon", value_key}
+    missing = required.difference(scenic_activity.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {sorted(missing)}")
+
+    # first average the biological samples within each condition and
+    # stage -- scenic_activity already has sample-level values, so
+    # samples contribute equally regardless of their original cell count
+    stage_activity = (
+        scenic_activity
+        .groupby([condition_key, celltype_key, "regulon"], observed=True)[value_key]
+        .mean()
+        .reset_index(name="mean_stage_auc")
+    )
+
+    # for each condition x regulon, quantify variation across all stages;
+    # stage_sd considers the complete activity profile, stage_range
+    # reports only the distance between the highest and lowest stage
+    stage_variation = (
+        stage_activity
+        .groupby([condition_key, "regulon"], observed=True)["mean_stage_auc"]
+        .agg(stage_sd="std", stage_range=lambda x: x.max() - x.min(), n_stages="count")
+        .reset_index()
+    )
+
+    # regulons with the largest variation across stages appear first
+    # within each experimental condition
+    stage_variation = stage_variation.sort_values(
+        [condition_key, "stage_sd"], ascending=[True, False],
+    ).reset_index(drop=True)
+
+    return stage_variation
+
+
+def SelectTopScenicStageVariation(
+    stage_variation,
+    *,
+    condition_key,
+    top_n=5,
+    variation_key="stage_sd",
+):
+    """
+    Select the regulons with the highest activity variation across stages,
+    independently within each experimental condition.
+
+    The union of the top regulons from all conditions is returned,
+    avoiding duplicated regulons when the same regulon is highly variable
+    in more than one condition.
+
+    Parameters
+    ----------
+    stage_variation : `CalculateScenicStageVariation` output.
+    condition_key : column identifying the experimental condition.
+    top_n : number of top variable regulons selected per condition.
+    variation_key : metric used to rank stage variation.
+
+    Returns
+    -------
+    (top_variation, top_regulons) : ranked rows per condition, and the
+    unique regulon names selected across conditions.
+    """
+    required = {condition_key, "regulon", variation_key}
+    missing = required.difference(stage_variation.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {sorted(missing)}")
+
+    if top_n < 1:
+        raise ValueError("`top_n` must be at least 1.")
+
+    # select the most variable regulons independently in each condition
+    top_variation = (
+        stage_variation
+        .sort_values([condition_key, variation_key], ascending=[True, False])
+        .groupby(condition_key, observed=True)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+
+    # union across conditions -- a regulon present in both top lists
+    # appears once
+    top_regulons = top_variation["regulon"].drop_duplicates().tolist()
+
+    return top_variation, top_regulons
+
+
+def PlotScenicActivityAcrossStages(
+    scenic_activity,
+    regulon,
+    *,
+    condition_key,
+    celltype_key,
+    sample_key="sample",
+    value_key="mean_auc",
+    stage_order=None,
+    condition_order=None,
+    figsize=(8, 5),
+):
+    """
+    Plot sample-level continuous AUCell activity across ordered cell
+    states, for one regulon.
+
+    Individual biological samples are shown separately, with the mean
+    profile of each condition overlaid. No smoothing or statistical test
+    is performed -- celltypes/maturation stages are treated as ordered
+    categories, not continuous pseudotime.
+
+    Parameters
+    ----------
+    scenic_activity : `SummarizeScenicActivity` output.
+    regulon : regulon to visualize.
+    condition_key : column identifying experimental conditions.
+    celltype_key : column identifying maturation stages/cell states.
+    sample_key : column identifying biological samples.
+    value_key : column containing sample-level AUCell values.
+    stage_order : order of maturation stages on the x-axis. Defaults to
+        `scenic_activity[celltype_key]`'s own appearance order.
+    condition_order : order of experimental conditions (legend/color
+        assignment order). Defaults to `scenic_activity[condition_key]`'s
+        own appearance order.
+    figsize : passed to `plt.subplots`.
+
+    Returns
+    -------
+    (fig, ax, plot_data) : figure, axes and the sample-level data plotted.
+    """
+    import matplotlib.pyplot as plt
+
+    required = {sample_key, condition_key, celltype_key, "regulon", value_key}
+    missing = required.difference(scenic_activity.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {sorted(missing)}")
+
+    # select one regulon while keeping all biological samples and stages
+    plot_data = scenic_activity.loc[scenic_activity["regulon"] == regulon].copy()
+    if plot_data.empty:
+        raise ValueError(f"Regulon '{regulon}' was not found.")
+
+    # each biological sample should belong to only one condition -- a
+    # sample split across conditions would silently double-count it in
+    # both condition-mean lines below
+    sample_conditions = plot_data[[sample_key, condition_key]].drop_duplicates()
+    if sample_conditions[sample_key].duplicated().any():
+        raise ValueError("A biological sample is associated with more than one condition.")
+
+    if stage_order is None:
+        stage_order = list(pd.unique(plot_data[celltype_key]))
+
+    if condition_order is None:
+        condition_order = list(pd.unique(plot_data[condition_key]))
+
+    plot_data[celltype_key] = pd.Categorical(
+        plot_data[celltype_key], categories=stage_order, ordered=True,
+    )
+    plot_data = plot_data.sort_values(celltype_key)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # plot each biological sample separately; samples from the same
+    # condition share the same automatically assigned color
+    for condition in condition_order:
+        condition_data = plot_data.loc[plot_data[condition_key] == condition]
+        color = ax._get_lines.get_next_color()
+
+        for sample in condition_data[sample_key].unique():
+            sample_data = condition_data.loc[condition_data[sample_key] == sample]
+            ax.plot(
+                sample_data[celltype_key], sample_data[value_key],
+                marker="o", linewidth=1, alpha=0.45, color=color, label=sample,
+            )
+
+        # mean across biological samples at each stage
+        condition_mean = (
+            condition_data
+            .groupby(celltype_key, observed=True)[value_key]
+            .mean()
+            .reindex(stage_order)
+        )
+        ax.plot(
+            stage_order, condition_mean,
+            marker="o", linewidth=3, color=color, label=f"{condition} mean",
+        )
+
+    ax.set_xlabel("Maturation stage")
+    ax.set_ylabel("Mean AUCell score")
+    ax.set_title(f"{regulon} activity across maturation stages")
+    ax.legend(frameon=False)
+
+    plt.tight_layout()
+
+    return fig, ax, plot_data
 
 
 # ── REACTOR (differential regulon activity across biological samples) ──

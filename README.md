@@ -161,12 +161,18 @@ pip install -e .
 | `CalculateScenicRSS` | Regulon Specificity Score per celltype x regulon, via pySCENIC's own `regulon_specificity_scores` |
 | `PlotScenicRSSHeatmap` | Heatmap of top-N regulons per celltype by RSS, built on `sctools.plots.PlotSignificanceHeatmap` (a rank flag stands in for the p-value: "*" = actually top-N for that specific celltype) |
 | `CalculateScenicRSSByCondition` | `CalculateScenicRSS` run separately per value of an `adata.obs` condition column (e.g. WT/KO), returns `{condition: rss_dataframe}` |
-| `PlotScenicRSSByConditionHeatmap` | Two-condition companion to `PlotScenicRSSHeatmap`: columns are `{celltype} {condition}` pairs (e.g. "G0 WT", "G0 KO", "G1 WT", ...) with a black separator per celltype, same top-N "*" convention |
+| `PlotScenicRSSByConditionHeatmap` | Two-condition companion to `PlotScenicRSSHeatmap`: columns are `{celltype} {condition}` pairs (e.g. "G0 WT", "G0 KO", "G1 WT", ...) with a black separator per celltype, same top-N "*" convention. Built on the shared `_PlotByConditionHeatmap` renderer |
+| `CalculateScenicActivityDifference` | Difference in mean continuous AUCell activity between two conditions per celltype x regulon, from sample-level `SummarizeScenicActivity` summaries (descriptive only, no test) |
+| `SelectTopScenicActivityDifferences` | Regulons with the largest `\|auc_difference\|` per celltype |
+| `PlotScenicActivityDifferenceHeatmap` | Continuous-AUCell analog of `PlotScenicRSSByConditionHeatmap`: same `{celltype} {condition}` layout and shared renderer, row z-scored for display since raw AUCell differs in magnitude between regulons. Default annotation is "*" for a top-difference regulon; `annotate_values=True` labels cells with the raw mean AUCell number instead (`annotate_top_only` restricts that to the selected cells) |
+| `PlotScenicActivityByConditionHeatmap` | Raw-mean-AUCell analog of `PlotScenicRSSByConditionHeatmap`: top-N regulons picked independently per `{celltype} {condition}` column (not once per celltype like `PlotScenicActivityDifferenceHeatmap`), no row scaling, cells labeled with the AUCell value |
+| `PlotScenicAucellByConditionHeatmap` | No-pipeline version of `PlotScenicActivityByConditionHeatmap`: goes straight from `adata.obsm[auc_key]` (pooling every cell per celltype x condition, no `SummarizeScenicActivity`/`CalculateScenicActivityDifference` step first) |
+| `CalculateScenicStageVariation` | How much each regulon's mean AUCell activity varies across celltypes/stages, separately per condition (`stage_sd`, `stage_range`) -- complements `CalculateScenicActivityDifference`'s across-condition comparison with a within-condition, across-stage one |
+| `SelectTopScenicStageVariation` | Most stage-variable regulons per condition, unioned across conditions |
+| `PlotScenicActivityAcrossStages` | Line plot of one regulon's mean AUCell activity across ordered celltypes/stages: individual biological samples plus each condition's mean overlaid, no smoothing or test |
 | `BuildReactorInputTables` | Binarizes AUCell (pySCENIC's own per-regulon `binarize()`) and builds REACTOR's three required input tables (RBM, clustering, study design) from `adata.obs` + the AUCell matrix, in one step |
 | `RunReactorProcessData` | rpy2 bridge to `REACTOR::processData()`: percent of cells with each regulon active, per (sample, celltype) |
 | `RunReactorDifferentialActivityROTS` | rpy2 bridge to `REACTOR::differentialActivityAnalysis()` (ROTS); derives the positional `groups` vector from a `{sample: condition}` mapping instead of requiring it hand-built in column order |
-| `SummarizeReactorResults` | Splits `RunReactorDifferentialActivityROTS`'s "celltype \| regulon" rows, adds per-condition means + delta_activity (test - reference), and returns the FDR-significant subset alongside the full table |
-| `FindMixedSignificanceRegulons` | Regulons significant in some celltypes but not others (REACTOR/FDR analog of the RSS top-N flag) |
 
 ## Typical QC workflow
 
