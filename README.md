@@ -158,6 +158,15 @@ pip install -e .
 | `RunRepeatedScenic` | Re-run GRNBoost2+cisTarget N times with different seeds, one `runs/run_NNN/` folder each -- GRNBoost2 is stochastic, single runs aren't trusted alone |
 | `BuildScenicConsensus` | Consensus regulons/targets across repeated runs (Garner et al. 2023): keep regulons/targets recurring in >80% of runs, regulons need >=5 high-confidence targets |
 | `ExportConsensusRegulons` | Export consensus targets to GMT, for a single final `RunScenicAucell` run using only high-confidence regulons |
+| `CalculateScenicRSS` | Regulon Specificity Score per celltype x regulon, via pySCENIC's own `regulon_specificity_scores` |
+| `PlotScenicRSSHeatmap` | Heatmap of top-N regulons per celltype by RSS, built on `sctools.plots.PlotSignificanceHeatmap` (a rank flag stands in for the p-value: "*" = actually top-N for that specific celltype) |
+| `CalculateScenicRSSByCondition` | `CalculateScenicRSS` run separately per value of an `adata.obs` condition column (e.g. WT/KO), returns `{condition: rss_dataframe}` |
+| `PlotScenicRSSByConditionHeatmap` | Two-condition companion to `PlotScenicRSSHeatmap`: columns are `{celltype} {condition}` pairs (e.g. "G0 WT", "G0 KO", "G1 WT", ...) with a black separator per celltype, same top-N "*" convention |
+| `BuildReactorInputTables` | Binarizes AUCell (pySCENIC's own per-regulon `binarize()`) and builds REACTOR's three required input tables (RBM, clustering, study design) from `adata.obs` + the AUCell matrix, in one step |
+| `RunReactorProcessData` | rpy2 bridge to `REACTOR::processData()`: percent of cells with each regulon active, per (sample, celltype) |
+| `RunReactorDifferentialActivityROTS` | rpy2 bridge to `REACTOR::differentialActivityAnalysis()` (ROTS); derives the positional `groups` vector from a `{sample: condition}` mapping instead of requiring it hand-built in column order |
+| `SummarizeReactorResults` | Splits `RunReactorDifferentialActivityROTS`'s "celltype \| regulon" rows, adds per-condition means + delta_activity (test - reference), and returns the FDR-significant subset alongside the full table |
+| `FindMixedSignificanceRegulons` | Regulons significant in some celltypes but not others (REACTOR/FDR analog of the RSS top-N flag) |
 
 ## Typical QC workflow
 

@@ -93,6 +93,13 @@ __all__ = [
     "RunRepeatedScenic",
     "BuildScenicConsensus",
     "ExportConsensusRegulons",
+    "CalculateScenicRSS",
+    "PlotScenicRSSHeatmap",
+    "CalculateScenicRSSByCondition",
+    "PlotScenicRSSByConditionHeatmap",
+    "BuildReactorInputTables",
+    "RunReactorProcessData",
+    "RunReactorDifferentialActivityROTS",
 ]
 
 
@@ -1401,3 +1408,623 @@ def ExportConsensusRegulons(
     print(f"Saved to: {gmt_path}")
 
     return gmt_path
+
+
+# ── Regulon Specificity Score (RSS) ──────────────────────────────────────
+
+def CalculateScenicRSS(
+    adata,
+    auc_table,
+    celltype_key,
+):
+    """
+    Calculate Regulon Specificity Scores (RSS) with pySCENIC's own
+    `regulon_specificity_scores`.
+
+    RSS compares each regulon's per-cell activity distribution (from an
+    AUCell run, typically the consensus one) against the distribution
+    representing membership in a given cell population -- higher RSS
+    means that regulon's activity is more specific to that population.
+    RSS is a specificity score, not a p-value; there is no associated
+    statistical test [Suo, 2018].
+
+    Parameters
+    ----------
+    adata : AnnData with `celltype_key` in `.obs`, cells matching `auc_table.index`.
+    auc_table : cells x regulons AUCell matrix (e.g. `ReadScenicAucell`/
+        `ImportScenicAucell` output from the consensus AUCell run).
+    celltype_key : `adata.obs` column defining cell populations.
+
+    Returns
+    -------
+    pd.DataFrame, celltype x regulon RSS matrix (index named `celltype_key`).
+    """
+    from pyscenic.rss import regulon_specificity_scores
+
+    cell_types = adata.obs.loc[auc_table.index, celltype_key]
+
+    rss = regulon_specificity_scores(auc_table, cell_types)
+    rss.index.name = celltype_key
+
+    return rss
+
+
+def PlotScenicRSSHeatmap(
+    rss,
+    *,
+    celltype_key="celltype",
+    top_n=5,
+    cmap="viridis",
+    figsize=(6, 8),
+    title=None,
+):
+    """
+    Heatmap of the top-N regulons per celltype by RSS (`CalculateScenicRSS`
+    output), built on `sctools.plots.PlotSignificanceHeatmap` -- reusing
+    its color+annotation machinery, but with a rank-based flag standing
+    in for the p-value it normally thresholds.
+
+    Columns/rows shown are the union of each celltype's own top-N
+    regulons, so a regulon pulled in because it's top-N for one celltype
+    also gets a full row for every other celltype. The "*" marks only
+    the cells where that regulon is ACTUALLY in that specific celltype's
+    own top N -- not every cell in a starred regulon's row is starred.
+
+    Parameters
+    ----------
+    rss : `CalculateScenicRSS` output.
+    celltype_key : name for the celltype axis, used only if `rss.index`
+        doesn't already have one (`CalculateScenicRSS` sets it).
+    top_n : regulons kept per celltype, deduplicated across celltypes.
+    cmap, figsize : passed to `PlotSignificanceHeatmap`. `center` is
+        fixed at `None` (RSS isn't diverging like log2FC, so the
+        default `center=0` diverging behavior doesn't apply here).
+    title : defaults to "Regulon Specificity Score (* = top {top_n} in
+        that celltype)".
+
+    Returns
+    -------
+    (value_table, flag_table, annot_table, rss_long) :
+        value_table/flag_table/annot_table are `PlotSignificanceHeatmap`'s
+        pivoted (regulon x celltype) outputs. rss_long is the long-format
+        table the heatmap was built from -- one row per (celltype,
+        regulon), with `RSS` and `is_top_flag` (0 = top-N in that
+        celltype) columns -- sorted by celltype, then is_top_flag (top-N
+        rows first), then RSS descending.
+    """
+    from sctools.plots import PlotSignificanceHeatmap
+
+    top_per_celltype = {ct: set(rss.loc[ct].nlargest(top_n).index) for ct in rss.index}
+    top_regulons = pd.Index(sorted(set().union(*top_per_celltype.values())))
+
+    rss_indexed = rss.copy()
+    rss_indexed.index.name = rss_indexed.index.name or celltype_key
+    group_col = rss_indexed.index.name
+
+    rss_long = (
+        rss_indexed[top_regulons]
+        .reset_index()
+        .melt(id_vars=group_col, var_name="regulon", value_name="RSS")
+    )
+
+    # Not a p-value: 0 marks a (celltype, regulon) pair where that regulon
+    # is actually in THIS celltype's own top N (not just pulled into the
+    # shown columns by being top N for a different celltype).
+    # padj_threshold=0.5 below turns flag==0 into the "*" annotation.
+    rss_long["is_top_flag"] = rss_long.apply(
+        lambda row: 0 if row["regulon"] in top_per_celltype[row[group_col]] else 1,
+        axis=1,
+    )
+
+    if title is None:
+        title = f"Regulon Specificity Score (* = top {top_n} in that celltype)"
+
+    value_table, flag_table, annot_table = PlotSignificanceHeatmap(
+        rss_long,
+        x=group_col,
+        y="regulon",
+        value_col="RSS",
+        pvalue_col="is_top_flag",
+        padj_threshold=0.5,
+        cmap=cmap,
+        center=None,
+        cbar_label="RSS",
+        title=title,
+        figsize=figsize,
+    )
+
+    rss_long = rss_long.sort_values(
+        [group_col, "is_top_flag", "RSS"],
+        ascending=[True, True, False],
+    ).reset_index(drop=True)
+
+    return value_table, flag_table, annot_table, rss_long
+
+
+def CalculateScenicRSSByCondition(
+    adata,
+    celltype_key,
+    condition_key,
+    *,
+    auc_key="X_scenic_auc",
+):
+    """
+    Run `CalculateScenicRSS` separately for each value of
+    `adata.obs[condition_key]` (e.g. WT/KO), subsetting both `adata` and
+    its AUCell matrix per condition. Never mutates `adata`.
+
+    Parameters
+    ----------
+    adata : AnnData with `auc_key` in `.obsm` and `celltype_key`/
+        `condition_key` in `.obs`.
+    celltype_key : `adata.obs` column defining cell populations.
+    condition_key : `adata.obs` column defining the conditions to split by.
+    auc_key : `.obsm` key holding the cells x regulons AUCell matrix.
+
+    Returns
+    -------
+    dict {condition_value: rss_dataframe}, one `CalculateScenicRSS`
+    output per condition.
+    """
+    rss_by_condition = {}
+
+    for condition_value in adata.obs[condition_key].unique():
+        adata_subset = adata[adata.obs[condition_key] == condition_value]
+        rss_by_condition[condition_value] = CalculateScenicRSS(
+            adata_subset,
+            adata_subset.obsm[auc_key],
+            celltype_key=celltype_key,
+        )
+
+    return rss_by_condition
+
+
+def PlotScenicRSSByConditionHeatmap(
+    rss_by_condition,
+    normal_condition,
+    compare_condition,
+    *,
+    top_n=10,
+    stage_order=None,
+    cmap="viridis",
+):
+    """
+    Heatmap comparing regulon specificity between two conditions, one
+    celltype at a time: columns are "{celltype} {normal_condition}",
+    "{celltype} {compare_condition}" pairs (e.g. "G0 WT", "G0 KO", "G1
+    WT", ...), separated by a black vertical line per celltype. Built on
+    `sctools.plots.PlotSignificanceHeatmap`, reusing its pivot/annotation
+    machinery via `plot=False` and rendering the figure here instead, to
+    get control over tick rotation and the celltype separators.
+
+    Rows are the union of each celltype's own top-N regulons across both
+    conditions, so every celltype x condition column can be compared
+    against the same regulon set. The "*" marks only the cells where
+    that regulon is ACTUALLY in that specific column's own top N -- not
+    every cell in a starred regulon's row is starred (same convention as
+    `PlotScenicRSSHeatmap`).
+
+    Parameters
+    ----------
+    rss_by_condition : `CalculateScenicRSSByCondition` output.
+    normal_condition, compare_condition : keys into `rss_by_condition`;
+        also set the left/right order within each celltype's column pair.
+    top_n : regulons kept per celltype (union across both conditions).
+    stage_order : optional explicit celltype order (e.g. maturation
+        stages); celltypes not listed are dropped. Defaults to
+        `rss_by_condition[normal_condition].index` order.
+    cmap : passed to `seaborn.heatmap`.
+
+    Returns
+    -------
+    (value_table, flag_table, annot_table, rss_long) : see
+    `PlotScenicRSSHeatmap` -- same four objects, now with a
+    "celltype_condition" column/axis instead of plain celltype.
+    """
+    from sctools.plots import PlotSignificanceHeatmap
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+
+    rss_normal = rss_by_condition[normal_condition]
+    rss_compare = rss_by_condition[compare_condition]
+
+    if stage_order is not None:
+        celltypes = [ct for ct in stage_order if ct in rss_normal.index]
+    else:
+        celltypes = list(rss_normal.index)
+
+    conditions = [(normal_condition, rss_normal), (compare_condition, rss_compare)]
+
+    # top-N regulons per celltype, unioned across both conditions AND
+    # across all celltypes -- one shared regulon axis so every column is
+    # comparable against the same rows
+    top_regulons = set()
+    for ct in celltypes:
+        for _, rss_table in conditions:
+            top_regulons |= set(rss_table.loc[ct].nlargest(top_n).index)
+    top_regulons = sorted(top_regulons)
+
+    # separately: is this regulon actually top-N for THIS specific
+    # celltype+condition column? (not just pulled in because it's top-N
+    # for some other celltype/condition) -- this is what gets starred
+    top_per_column = {
+        (ct, condition): set(rss_table.loc[ct].nlargest(top_n).index)
+        for ct in celltypes
+        for condition, rss_table in conditions
+    }
+
+    records = []
+    for ct in celltypes:
+        for condition, rss_table in conditions:
+            top_set = top_per_column[(ct, condition)]
+            for regulon in top_regulons:
+                records.append({
+                    "celltype_condition": f"{ct} {condition}",
+                    "regulon": regulon,
+                    "RSS": rss_table.loc[ct, regulon],
+                    # not a p-value -- 0 means "in this column's own top
+                    # N"; padj_threshold=0.5 below turns 0 into "*"
+                    "is_top_flag": 0 if regulon in top_set else 1,
+                })
+
+    rss_long = pd.DataFrame(records)
+
+    column_order = [
+        f"{ct} {cond}" for ct in celltypes for cond in (normal_condition, compare_condition)
+    ]
+
+    value_table, flag_table, annot_table = PlotSignificanceHeatmap(
+        rss_long,
+        x="celltype_condition",
+        y="regulon",
+        value_col="RSS",
+        pvalue_col="is_top_flag",
+        padj_threshold=0.5,
+        order_x=column_order,
+        order_y=top_regulons,
+        sort_by_magnitude=False,
+        plot=False,
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(max(10, 0.5 * len(column_order)), max(6, 0.35 * len(top_regulons)))
+    )
+
+    sns.heatmap(
+        value_table,
+        ax=ax,
+        cmap=cmap,
+        cbar_kws={"label": "RSS"},
+        annot=annot_table,
+        fmt="",
+        linewidths=0.4,
+        linecolor="white",
+    )
+
+    ax.set_title(
+        f"Regulon specificity by celltype x condition "
+        f"(top {top_n} per celltype, * = top {top_n} in that column)"
+    )
+    ax.set_xlabel("celltype_condition")
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+
+    # black separator every 2 columns -- marks each celltype's
+    # normal/compare pair. sns.heatmap places column boundaries at
+    # integer positions (0, 1, 2, ...), unlike imshow's -0.5 offset.
+    for i in range(1, len(celltypes)):
+        ax.axvline(i * 2, color="black", linewidth=1.5)
+
+    plt.tight_layout()
+    plt.show()
+
+    return value_table, flag_table, annot_table, rss_long
+
+
+# ── REACTOR (differential regulon activity across biological samples) ──
+#
+# REACTOR (Lindén et al., 2026 -- github.com/elolab/REACTOR) tests
+# whether the *fraction of cells with a regulon active* differs between
+# conditions, using biological samples (not cells) as replicates, scored
+# with ROTS (Reproducibility-Optimized Test Statistic). It's an R
+# package; these functions bridge to it via rpy2 and need a working `R`
+# with REACTOR and its dependency ROTS (Bioconductor) installed in the
+# same environment -- see the module docstring's environment note for
+# why that's usually the `scenic_env`-style environment already used for
+# the `pyscenic` CLI calls above, not necessarily the one running this
+# notebook's own Python kernel.
+
+def BuildReactorInputTables(
+    adata,
+    auc_table,
+    *,
+    sample_key,
+    condition_key,
+    celltype_key,
+    seed=42,
+    num_workers=3,
+):
+    """
+    Binarize a cells x regulons AUCell matrix and build the three input
+    tables `REACTOR::processData()` requires from it + `adata.obs`.
+    Never mutates `adata` or `auc_table`.
+
+    Binarization is pySCENIC's own `binarize()`: a threshold estimated
+    separately per regulon from its own AUCell-score distribution
+    (Hartigan's dip test picks unimodal vs bimodal; unimodal -> mean +
+    2*SD, bimodal -> the density minimum between the two modes) -- not
+    one fixed cutoff shared by every regulon.
+
+    Parameters
+    ----------
+    adata : AnnData with `sample_key`/`condition_key`/`celltype_key` in `.obs`.
+    auc_table : cells x regulons AUCell matrix (continuous scores),
+        indexed the same as (all or a subset of) `adata.obs_names`.
+    seed, num_workers : passed to `binarize()`.
+
+    Returns
+    -------
+    (rbm, clustering, study_design, binary_auc, auc_thresholds) :
+        rbm            -- cellID + one 0/1 column per regulon (REACTOR's
+                           "RBM" argument).
+        clustering     -- cellID, celltype (REACTOR's "Clustering").
+        study_design   -- cellID, sample, condition (REACTOR's "StudyDesign").
+        binary_auc     -- the raw cells x regulons 0/1 matrix `rbm` was
+                           built from, e.g. to store back into
+                           `adata.obsm` yourself if wanted.
+        auc_thresholds -- per-regulon activity threshold `binarize()` used.
+    """
+    from pyscenic.binarization import binarize
+
+    binary_auc, auc_thresholds = binarize(auc_table, seed=seed, num_workers=num_workers)
+
+    # REACTOR's "RBM" (regulon binary matrix): one 0/1 column per
+    # regulon, cell identifier as its own explicit column rather than
+    # the DataFrame index (R data.frames sent over rpy2 don't carry a
+    # pandas index the way REACTOR expects to read "cellID" from)
+    rbm = binary_auc.copy()
+    rbm.insert(0, "cellID", rbm.index.astype(str))
+    rbm = rbm.reset_index(drop=True)
+
+    # celltype label per cell, same cell set/order as rbm (REACTOR joins
+    # these three tables internally on cellID, but keeping them aligned
+    # here too makes the intermediate tables easier to sanity-check)
+    clustering = adata.obs.loc[binary_auc.index, [celltype_key]].copy()
+    clustering.insert(0, "cellID", clustering.index.astype(str))
+    clustering = clustering.reset_index(drop=True)
+    clustering.columns = ["cellID", "celltype"]
+
+    # biological sample + experimental condition per cell -- this is
+    # what lets REACTOR aggregate cells into (sample, celltype) groups
+    # downstream, so replicates become biological samples, not cells
+    study_design = adata.obs.loc[binary_auc.index, [sample_key, condition_key]].copy()
+    study_design.insert(0, "cellID", study_design.index.astype(str))
+    study_design = study_design.reset_index(drop=True)
+    study_design.columns = ["cellID", "sample", "condition"]
+
+    return rbm, clustering, study_design, binary_auc, auc_thresholds
+
+
+def RunReactorProcessData(
+    rbm,
+    clustering,
+    study_design,
+    *,
+    min_cells=10,
+):
+    """
+    Run `REACTOR::processData()` via rpy2: for each (biological sample,
+    celltype) pair with at least `min_cells` cells, calculates the
+    percentage of cells in which each regulon is active.
+
+    Parameters
+    ----------
+    rbm, clustering, study_design : `BuildReactorInputTables` output
+        (column names "cellID"/regulons, "cellID"/"celltype",
+        "cellID"/"sample"/"condition" respectively -- fixed, since
+        that's what `BuildReactorInputTables` always produces).
+    min_cells : REACTOR's own default; a (sample, celltype) combination
+        below this is dropped before the differential analysis.
+
+    Returns
+    -------
+    pd.DataFrame: "{celltype} | {regulon}" rows x biological-sample
+    columns, percent of cells with the regulon active in that sample
+    (NOT AUCell mean) -- pass this straight to
+    `RunReactorDifferentialActivityROTS`.
+    """
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+
+    # hand the three tables to R as global variables -- rpy2 has no
+    # "call this R function with these Python objects as arguments"
+    # shortcut for a bare `ro.r()` string, so the R snippet below reads
+    # them back by the same names
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        ro.globalenv["rbm"] = ro.conversion.py2rpy(rbm)
+        ro.globalenv["clustering"] = ro.conversion.py2rpy(clustering)
+        ro.globalenv["studyDesign"] = ro.conversion.py2rpy(study_design)
+
+    # condition_cName/donor_cName/cluster_cName are fixed to match the
+    # column names BuildReactorInputTables always produces
+    ro.r(f"""
+    regulonActivity <- REACTOR::processData(
+        minCells = {min_cells},
+        RBM = rbm,
+        StudyDesign = studyDesign,
+        Clustering = clustering,
+        condition_cName = "condition",
+        donor_cName = "sample",
+        cluster_cName = "celltype"
+    )
+    """)
+
+    # read the R result back out of the R global environment into a
+    # pandas DataFrame
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        regulon_activity = ro.conversion.rpy2py(ro.globalenv["regulonActivity"])
+
+    return regulon_activity
+
+
+def RunReactorDifferentialActivityROTS(
+    regulon_activity,
+    sample_conditions,
+    *,
+    reference_condition,
+    test_condition,
+    seed=42,
+    K=100,
+):
+    """
+    Run `REACTOR::differentialActivityAnalysis()` (ROTS-based) on a
+    `RunReactorProcessData` table.
+
+    ROTS' `groups` argument is positional -- aligned to `data`'s column
+    order, not by name -- so building it by hand from a column list you
+    read off separately is an easy way to silently mismatch samples to
+    conditions. This derives `groups` directly from
+    `regulon_activity.columns`, and raises if any column has no
+    condition given.
+
+    The comparison is defined as:
+        test_condition      -> group 1
+        reference_condition -> group 2
+
+    The function follows the REACTOR vignette by passing the
+    sample-level regulon activity matrix directly to
+    `differentialActivityAnalysis()` without overriding the ROTS
+    `log` argument.
+
+    Parameters
+    ----------
+    regulon_activity : `RunReactorProcessData` output.
+
+    sample_conditions : {sample_name: condition}, must cover every
+        column of `regulon_activity`.
+
+    reference_condition, test_condition : define the two groups used
+        by ROTS (test -> group 1, reference -> group 2).
+
+    seed : random seed passed to ROTS.
+
+    K : largest top-list size considered during ROTS reproducibility
+        optimization. The REACTOR vignette uses K=100.
+
+    Returns
+    -------
+    pd.DataFrame
+        REACTOR's differential activity table, containing the original
+        biological-sample columns plus:
+        `d`: Reproducibility-optimized ROTS test statistic.
+        `p`: ROTS p-value.
+        `fdr`: ROTS false discovery rate.
+        `fc`: Effect estimate returned by ROTS.
+        Rows are indexed by "{celltype} | {regulon}".
+
+    Notes
+    -----
+    The complete ROTS object is retained in the R global environment
+    as `ROTS_obj`, allowing the diagnostic plots implemented by ROTS
+    and shown in the REACTOR vignette to be generated afterwards.
+    """
+
+    # fail before touching R at all if a column can't be mapped to a
+    # condition -- a silent misalignment here would still "work" (ROTS
+    # doesn't know a sample was assigned to the wrong group) and just
+    # quietly produce a wrong result
+    missing = set(regulon_activity.columns) - set(sample_conditions)
+
+    if missing:
+        raise ValueError(
+            f"No condition given for sample(s): {sorted(missing)}"
+        )
+
+    # make sure only the two requested conditions are represented in
+    # the samples that actually occur in regulon_activity
+    valid_conditions = {
+        test_condition,
+        reference_condition,
+    }
+
+    unexpected_conditions = {
+        sample_conditions[s]
+        for s in regulon_activity.columns
+        if sample_conditions[s] not in valid_conditions
+    }
+
+    if unexpected_conditions:
+        raise ValueError(
+            f"Unexpected condition(s): {sorted(unexpected_conditions)}. "
+            f"Expected only '{test_condition}' and "
+            f"'{reference_condition}'."
+        )
+
+    # build the positional groups vector in regulon_activity's own
+    # column order, rather than trusting it to have been typed by hand
+    # to match -- test_condition -> group 1,
+    # reference_condition -> group 2
+    condition_to_group = {
+        test_condition: 1,
+        reference_condition: 2,
+    }
+
+    groups = [
+        condition_to_group[sample_conditions[s]]
+        for s in regulon_activity.columns
+    ]
+
+    if len(set(groups)) != 2:
+        raise ValueError(
+            f"Expected exactly the 2 conditions "
+            f"'{test_condition}'/'{reference_condition}' "
+            f"among regulon_activity's columns; "
+            f"found group codes {sorted(set(groups))}."
+        )
+
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+
+    # transfer the sample-level regulon activity matrix to R
+    with localconverter(
+        ro.default_converter + pandas2ri.converter
+    ):
+        ro.globalenv["regulonActivity"] = (
+            ro.conversion.py2rpy(regulon_activity)
+        )
+
+    # a plain integer vector doesn't need the pandas converter
+    ro.globalenv["groups"] = ro.IntVector(groups)
+
+    # differentialActivityAnalysis() returns:
+    #   DAA_out[[1]] -> complete ROTS object
+    #   DAA_out[[2]] -> REACTOR results table
+    #
+    # Keep the complete ROTS object in R so it remains available for
+    # the diagnostic plots shown in the REACTOR vignette.
+    ro.r(
+        f"""
+        DAA_out <- REACTOR::differentialActivityAnalysis(
+            data = regulonActivity,
+            groups = groups,
+            seed = {seed},
+            K = {K}
+        )
+
+        ROTS_obj <- DAA_out[[1]]
+        reactor_results <- DAA_out[[2]]
+        """
+    )
+
+    # only the result table needs to be transferred back to Python;
+    # ROTS_obj remains available in the R global environment
+    with localconverter(
+        ro.default_converter + pandas2ri.converter
+    ):
+        reactor_results = ro.conversion.rpy2py(
+            ro.globalenv["reactor_results"]
+        )
+
+    return reactor_results
