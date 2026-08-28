@@ -274,11 +274,16 @@ def PseudoPCA(
     )
 
     if valid_rank_obs_keys:
-        dc.tl.rankby_obsm(
-            pdata_out,
-            key="X_pca",
-            obs_keys=valid_rank_obs_keys,
-        )
+        # decoupler's rankby_obsm no longer accepts an `obs_keys` filter (removed
+        # between decoupler versions) -- it now always tests every column in
+        # `adata.obs`. To keep testing only the curated `valid_rank_obs_keys`
+        # columns, run it on a copy whose `.obs` is restricted to those columns,
+        # then copy the result back into `pdata_out.uns`.
+        pdata_rank_input = pdata_out.copy()
+        pdata_rank_input.obs = pdata_rank_input.obs[valid_rank_obs_keys].copy()
+        dc.tl.rankby_obsm(pdata_rank_input, key="X_pca")
+        if "rank_obsm" in pdata_rank_input.uns:
+            pdata_out.uns["rank_obsm"] = pdata_rank_input.uns["rank_obsm"]
     else:
         logger.info("No valid obs columns found for rankby_obsm.")
 
