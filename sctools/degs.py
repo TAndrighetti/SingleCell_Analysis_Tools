@@ -21,6 +21,10 @@ Typical usage order:
     PseudoDESeq2()                      -> DESeq2 contrast on raw pseudobulk counts (PyDESeq2)
     VolcanoGridByGroup()                -> volcano grid, one panel per celltype
 
+Single-cell DE with MAST (hurdle model, via R) lives in `sctools.mast`. Its
+output uses the same column names (`log2FoldChange`, `padj`, `stat`), so
+`VolcanoGridByGroup` works on it too (pass `col_gene="gene_id"`).
+
 Feature-set / pathway activity (hallmark/progeny/collectri via decoupler
 ULM) lives in `sctools.functionalanalysis`, not here -- `PseudoDESeq2`'s
 second return value (`data`) is the boundary between the two modules: it's

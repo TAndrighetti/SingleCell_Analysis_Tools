@@ -8,6 +8,8 @@ results/
 outputs/
 ignore/
 
+tutoriais/ongoing/
+
 *.h5
 *.h5ad
 *.mtx

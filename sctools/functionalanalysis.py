@@ -17,6 +17,7 @@ collectri = dc.op.collectri(organism="mouse")
 Typical usage order:
     PrepareULMInput()              -> optional: build one celltype's ULM input from a long-format DE table (e.g. reloaded from CSV in a separate notebook); skip this if you still have `PseudoDESeq2`'s `data` in memory
     RunULM()                       -> run ULM for ONE input against any net, + optional barplot (pass `ax=` for a grid)
+    RunGSEAByCelltype()            -> GSEA (ranked by DE stat) for every celltype of a long-format DE table, returns a long table for PlotSignificanceHeatmap
     MeltActsPadjToLong()           -> combine several celltypes' stored acts/padj into one tidy table
     BuildSignificantFeatureTable() -> long-format table restricted to significant hits, + category/direction columns
     SummarizeFeatureCategories()   -> per-celltype/category summary from that table
@@ -101,6 +102,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "PrepareULMInput",
     "RunULM",
+    "RunGSEAByCelltype",
     "MeltActsPadjToLong",
     "BuildSignificantFeatureTable",
     "SummarizeFeatureCategories",
@@ -303,6 +305,120 @@ def RunULM(
             plt.close()
 
     return hm_acts, hm_padj
+
+
+def RunGSEAByCelltype(
+    de_long: pd.DataFrame,
+    net: pd.DataFrame,
+    *,
+    contrast_name: str = "KO.vs.WT",
+    celltype_col: str = "celltype",
+    gene_col: str = "gene_id",
+    value_col: str = "stat",
+    celltypes: Sequence[str] | None = None,
+    times: int = 1000,
+    seed: int = 42,
+    tmin: int = 5,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """
+    Run decoupler GSEA per celltype on a long-format DE table.
+
+    Genes are ranked by `value_col` inside each celltype (default "stat":
+    the DESeq2 Wald statistic from `PseudoDESeq2`, or the signed MAST
+    statistic from `sctools.mast.RunMAST`). Genes with NaN in `value_col`
+    are dropped. `padj` is corrected by decoupler across the pathways of
+    one celltype (not across celltypes).
+
+    Permutation resolution: decoupler computes the GSEA p-value as the
+    fraction of permutations with an ES at least as extreme as the observed
+    one, without a +1 correction. When no permutation reaches it, p and
+    padj are exactly 0 (the truth is p < 1/times). With m pathways, BH needs
+    p < 0.05/m, so small `times` makes the significance calls depend on the
+    number of permutations, not on the effect. Rule of thumb: times > 2*m/0.05
+    (about 2000 for hallmark, m=50; about 41000 for Reactome, m~1000). A
+    warning is logged when padj == 0 appears and `times` is below this.
+    With enough permutations padj == 0 can still appear for strong
+    effects; report it as padj < m/times.
+
+    The output is long-format, ready for
+    `sctools.plots.PlotSignificanceHeatmap(gsea_long, x=celltype_col,
+    y="pathway", value_col="NES", pvalue_col="padj", ...)`.
+
+    Parameters
+    ----------
+    de_long : long-format DE table, one row per (celltype, gene).
+    net : decoupler network (e.g. dc.op.hallmark(organism="mouse")).
+    contrast_name : "{compare_condition}.vs.{normal_condition}", same
+        convention as `RunULM`. Used for the `direction` column.
+    celltype_col, gene_col, value_col : columns of `de_long`.
+    celltypes : celltypes to run. If None, all in `de_long` (order of appearance).
+    times : number of permutations for the GSEA null distribution. See
+        "Permutation resolution" above.
+    seed : random seed for the permutations.
+    tmin : minimum number of genes of a pathway present in the ranking.
+    verbose : passed to `dc.mt.gsea`.
+
+    Returns
+    -------
+    DataFrame with columns: celltype_col, pathway, NES, padj, direction.
+    `direction` is compare_condition when NES > 0, normal_condition when
+    NES < 0, NaN otherwise.
+    """
+    import decoupler as dc
+
+    compare_condition, normal_condition = contrast_name.split(".vs.")
+
+    if celltypes is None:
+        celltypes = list(pd.unique(de_long[celltype_col]))
+
+    ranked = de_long.dropna(subset=[value_col])
+
+    results = []
+    for celltype in celltypes:
+        logger.info("GSEA: %s", celltype)
+        data = PrepareULMInput(
+            ranked,
+            celltype,
+            celltype_col=celltype_col,
+            gene_col=gene_col,
+            value_col=value_col,
+            contrast_name=contrast_name,
+        )
+        score, padj = dc.mt.gsea(
+            data=data, net=net, tmin=tmin, times=times, seed=seed, verbose=verbose
+        )
+        gsea_df = pd.DataFrame({
+            celltype_col: celltype,
+            "pathway": score.columns,
+            "NES": score.iloc[0].to_numpy(),
+            "padj": padj.iloc[0].to_numpy(),
+        })
+        results.append(gsea_df.sort_values("NES", ascending=False))
+
+    gsea_long = pd.concat(results, ignore_index=True)
+
+    # decoupler's permutation p-value has no +1 correction, so p (and padj)
+    # is exactly 0 when no permutation reaches the observed ES. With m
+    # pathways, BH needs p < 0.05/m, so resolving it needs times > m/0.05.
+    n_zero = int((gsea_long["padj"] == 0).sum())
+    n_tested = int(gsea_long.groupby(celltype_col).size().max())
+    suggested = int(np.ceil(2 * n_tested / 0.05 / 1000) * 1000)
+    if n_zero and times < suggested:
+        logger.warning(
+            "GSEA: %d result(s) have padj == 0 (no permutation out of times=%d "
+            "reached the observed ES). This means p < 1/%d, not p = 0, and with "
+            "%d pathways tested the significance calls depend on the number of "
+            "permutations. Consider times >= %d.",
+            n_zero, times, times, n_tested, suggested,
+        )
+
+    gsea_long["direction"] = np.select(
+        [gsea_long["NES"] > 0, gsea_long["NES"] < 0],
+        [compare_condition, normal_condition],
+        default=None,
+    )
+    return gsea_long
 
 
 def _BuildFeatureToCategoryMap(category_map: dict, prefix: str = "") -> dict:

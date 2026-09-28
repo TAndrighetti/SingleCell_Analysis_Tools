@@ -66,6 +66,7 @@ from sctools.preprocessing import (
     RunNeighborsAndUmap,
 )
 from sctools.alra import RunAlraOnAnnData
+from sctools.mast import RunMAST, RunMASTByCelltype
 
 from sctools.annotation import (
     CalculateModuleScores,
@@ -104,6 +105,7 @@ from sctools.degs import (
 from sctools.functionalanalysis import (
     PrepareULMInput,
     RunULM,
+    RunGSEAByCelltype,
     MeltActsPadjToLong,
     BuildSignificantFeatureTable,
     SummarizeFeatureCategories,
