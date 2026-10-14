@@ -70,7 +70,6 @@ import sys
 from pathlib import Path
 from urllib.request import urlretrieve
 
-import loompy
 import numpy as np
 import pandas as pd
 from scipy import sparse
@@ -488,6 +487,8 @@ def ExportScenicLoom(
         "nUMI": n_umi,
     }
 
+    import loompy
+
     loompy.create(str(loom_path), loom_matrix, row_attributes, column_attributes)
 
     print(f"Loom file created: {loom_path}")
@@ -496,7 +497,7 @@ def ExportScenicLoom(
     return loom_path
 
 
-def _resolve_pyscenic_path(pyscenic_path):
+def _ResolvePyscenicPath(pyscenic_path):
     """
     Find a working `pyscenic` CLI binary.
 
@@ -549,7 +550,7 @@ def RunScenicGrn(
     loom_path, tf_path : `ExportScenicLoom`/`DownloadScenicResources` outputs.
     output_dir : `adjacencies.tsv` is written here.
     pyscenic_path : explicit path to the `pyscenic` binary; if None
-        (default), resolved via `_resolve_pyscenic_path` (see module
+        (default), resolved via `_ResolvePyscenicPath` (see module
         docstring for why `$PATH` alone isn't trusted, and for the
         numpy<1.24 requirement).
     num_workers : Dask worker count for GRNBoost2 -- CPU-bound, scale
@@ -576,7 +577,7 @@ def RunScenicGrn(
     if not tf_path.exists():
         raise FileNotFoundError(f"TF list not found: {tf_path}")
 
-    pyscenic_path = _resolve_pyscenic_path(pyscenic_path)
+    pyscenic_path = _ResolvePyscenicPath(pyscenic_path)
 
     if shutil.which(pyscenic_path) is None and not Path(pyscenic_path).exists():
         raise RuntimeError(
@@ -727,7 +728,7 @@ def RunScenicCtx(
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
 
-    pyscenic_path = _resolve_pyscenic_path(pyscenic_path)
+    pyscenic_path = _ResolvePyscenicPath(pyscenic_path)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -833,7 +834,7 @@ def RunScenicAucell(
     if not regulons_path.exists():
         raise FileNotFoundError(f"Regulon file not found: {regulons_path}")
 
-    pyscenic_path = _resolve_pyscenic_path(pyscenic_path)
+    pyscenic_path = _ResolvePyscenicPath(pyscenic_path)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -900,6 +901,8 @@ def ReadScenicAucell(aucell_path):
     if not aucell_path.exists():
         raise FileNotFoundError(f"AUCell file not found: {aucell_path}")
 
+    import loompy
+
     with loompy.connect(str(aucell_path), mode="r", validate=False) as loom:
 
         if "CellID" not in loom.ca.keys():
@@ -949,6 +952,8 @@ def ImportScenicAucell(
 
     if not aucell_path.exists():
         raise FileNotFoundError(f"AUCell file not found: {aucell_path}")
+
+    import loompy
 
     with loompy.connect(str(aucell_path), mode="r", validate=False) as loom:
 

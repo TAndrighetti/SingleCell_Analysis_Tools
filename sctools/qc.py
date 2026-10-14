@@ -37,9 +37,12 @@ import matplotlib.pyplot as plt
 logger = logging.getLogger(__name__)
 
 # Gene-symbol regex patterns — case-insensitive to cover human (MT-) and mouse (mt-)
+# FIX: lookaheads exclude the S6 kinases (Rps6ka*/Rps6kb*), which are not
+# ribosomal proteins, and Hbegf (EGF-like growth factor), which is not a
+# hemoglobin gene. Before, they were counted in pct_counts_ribo / pct_counts_hb.
 _MT_PATTERN   = r"(?i)^mt-"
-_RIBO_PATTERN = r"(?i)^rp[sl]"
-_HB_PATTERN   = r"(?i)^hb(?:a|b|d|e|g|m|q|z)"
+_RIBO_PATTERN = r"(?i)^rp[sl](?!6k)"
+_HB_PATTERN   = r"(?i)^hb(?!egf)(?:a|b|d|e|g|m|q|z)"
 
 ########################################################################################
 # ── 1. AMBIENT RNA CORRECTION ─────────────────────────────────────────────────────────
@@ -496,7 +499,7 @@ _SUMMARY_STAT_COLS = {
 }
 
 
-def _scenarios_absolute(adata, threshold_grid):
+def _ScenariosAbsolute(adata, threshold_grid):
     """Yield (meta_dict, keep_mask) for each combination of absolute thresholds.
 
     threshold_grid example::
@@ -529,7 +532,7 @@ def _scenarios_absolute(adata, threshold_grid):
         yield meta, keep                                        # deliver this scenario's metadata and cell mask
 
 
-def _mad_bounds(values, nmads, tail):
+def _MadBounds(values, nmads, tail):
     med = np.median(values)                            # median of the distribution
     mad = median_abs_deviation(values)                 # median absolute deviation
     lo = med - nmads * mad if tail in ("lower", "both") else -np.inf   # lower bound (or -inf if not needed)
@@ -537,7 +540,7 @@ def _mad_bounds(values, nmads, tail):
     return lo, hi                                      # return the two cut-off values
 
 
-def _scenarios_mads(adata, threshold_grid):
+def _ScenariosMads(adata, threshold_grid):
     """Yield (meta_dict, keep_mask) for each combination of MAD-based thresholds."""
     obs = adata.obs
     per_metric = {}                                    # will hold {metric: [(lo, hi, meta), ...]}
@@ -548,7 +551,7 @@ def _scenarios_mads(adata, threshold_grid):
         source_col = f"log1p_{metric}" if use_log1p else metric   # column to compute MAD on
         entries = []
         for nmads in spec["mads"]:                     # one entry per nmads value
-            lo_t, hi_t = _mad_bounds(obs[source_col].values, nmads, tail)  # bounds in transformed space
+            lo_t, hi_t = _MadBounds(obs[source_col].values, nmads, tail)  # bounds in transformed space
             meta = {f"{metric}_nmads": nmads}          # record nmads in summary row
             if use_log1p:
                 # Report bounds in log1p space and convert back to original scale
@@ -608,7 +611,7 @@ def EvaluateQcThresholds(adata, threshold_grid, *, method="absolute", return_cel
                 f"'{metric}' not found in adata.obs. Run CalculateQcMetrics() first."
             )
 
-    gen = _scenarios_absolute if method == "absolute" else _scenarios_mads   # pick the right generator
+    gen = _ScenariosAbsolute if method == "absolute" else _ScenariosMads   # pick the right generator
     obs = adata.obs
     rows, flags = [], {}                               # rows → summary table; flags → per-cell masks
 
@@ -684,7 +687,7 @@ def FilterQcCells(adata, cutoffs, *, method="absolute"):
             tail = spec.get("tail", "both")
             use_log1p = metric in _LOG1P_COUNT_COLS and f"log1p_{metric}" in adata.obs.columns
             source_col = f"log1p_{metric}" if use_log1p else metric
-            lo_t, hi_t = _mad_bounds(adata.obs[source_col].values, spec["mads"], tail)
+            lo_t, hi_t = _MadBounds(adata.obs[source_col].values, spec["mads"], tail)
             lo = np.expm1(lo_t) if use_log1p and np.isfinite(lo_t) else lo_t
             hi = np.expm1(hi_t) if use_log1p and np.isfinite(hi_t) else hi_t
             col = adata.obs[metric].values
@@ -1116,7 +1119,7 @@ def PlotQcBoxplots(
     show : display the figure.
     save_path : file path to save the figure.
     """
-    from sctools.plots import plot_metric_pairs
+    from sctools.plots import PlotMetricPairs
 
     # Both dicts must have the same samples in the same order
     if set(adatas_before) != set(adatas_after):
@@ -1124,7 +1127,7 @@ def PlotQcBoxplots(
 
     sample_names = list(adatas_before.keys())
 
-    return plot_metric_pairs(
+    return PlotMetricPairs(
         adatas_before=[adatas_before[s] for s in sample_names],
         adatas_after=[adatas_after[s] for s in sample_names],
         sample_names=sample_names,

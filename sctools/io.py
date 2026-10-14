@@ -11,36 +11,36 @@ Supported formats
 
 Main functions
 --------------
-:func:`load_sample`   -- load a single sample
-:func:`load_samples`  -- load multiple samples and concatenate
+:func:`LoadSample`   -- load a single sample
+:func:`LoadSamples`  -- load multiple samples and concatenate
 
 Quick example
 -------------
->>> from sctools.io import load_sample, load_samples
+>>> from sctools.io import LoadSample, LoadSamples
 
 >>> # Single sample — H5
->>> adata = load_sample(
+>>> adata = LoadSample(
 ...     "/data/s1/filtered_feature_bc_matrix.h5",
 ...     format="10x_h5",
 ...     sample_name="ctrl_1",
 ... )
 
 >>> # Single sample — MTX folder (Cell Ranger or BD Rhapsody)
->>> adata = load_sample(
+>>> adata = LoadSample(
 ...     "/data/s1/outs/filtered_feature_bc_matrix/",
 ...     format="mtx",
 ...     sample_name="ctrl_1",
 ... )
 
 >>> # Multiple samples, same format
->>> adata = load_samples(
+>>> adata = LoadSamples(
 ...     {"ctrl_1": "/data/ctrl_1/filtered.h5",
 ...      "ko_1":   "/data/ko_1/filtered.h5"},
 ...     format="10x_h5",
 ... )
 
 >>> # Multiple samples, mixed formats
->>> adata = load_samples(
+>>> adata = LoadSamples(
 ...     {"cb_1":  "/data/cb_1/cellbender_out.h5",
 ...      "raw_2": "/data/raw_2/filtered_feature_bc_matrix/"},
 ...     format={"cb_1": "cellbender", "raw_2": "mtx"},
@@ -67,7 +67,7 @@ FormatType = Literal["h5", "mtx"]
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def load_sample(
+def LoadSample(
     path: str | Path,
     *,
     format: FormatType = "h5",
@@ -75,8 +75,9 @@ def load_sample(
     sample_col: str = "sample",
     obs_meta: dict[str, str] | None = None,
     include_qc_metrics: bool = False,
+    prefix: str = "",
 ) -> AnnData:
-    
+
     """Load a single scRNA-seq sample into AnnData.
 
     Parameters
@@ -94,6 +95,10 @@ def load_sample(
     sample_name :
         Sample identifier stored in ``adata.obs[sample_col]`` and prepended
         to barcodes to ensure uniqueness when concatenating.
+    prefix :
+        Only for ``format="mtx"``. Prefix of the MTX file names, e.g.
+        ``"P9.scRNA."`` for ``P9.scRNA.matrix.mtx.gz``. Default ``""``
+        expects ``matrix.mtx.gz``, ``features.tsv.gz`` and ``barcodes.tsv.gz``.
     sample_col :
         Column name in ``adata.obs`` for the sample identifier. Default ``"sample"``.
     obs_meta :
@@ -115,11 +120,11 @@ def load_sample(
 
     """
     path = Path(path)
-    _require_exists(path)
+    _RequireExists(path)
 
     loaders = {
         "h5":  lambda: sc.read_10x_h5(path),
-        "mtx": lambda: sc.read_10x_mtx(path, gex_only=False),
+        "mtx": lambda: sc.read_10x_mtx(path, gex_only=False, prefix=prefix),
     }
     if format not in loaders:
         raise ValueError(
@@ -152,13 +157,13 @@ def load_sample(
         CalculateQcMetrics(adata)
 
     logger.info(
-        "load_sample '%s': %d cells x %d genes [%s].",
+        "LoadSample '%s': %d cells x %d genes [%s].",
         sample_name or path.name, adata.n_obs, adata.n_vars, format,
     )
     return adata
 
 
-def load_samples(
+def LoadSamples(
     samples: dict[str, str | Path],
     *,
     format: FormatType | dict[str, FormatType] = "h5",
@@ -201,7 +206,7 @@ def load_samples(
     --------
     Same format for all samples::
 
-        adata = load_samples(
+        adata = LoadSamples(
             {"ctrl": "/data/ctrl/filtered.h5",
              "ko":   "/data/ko/filtered.h5"},
             format="h5",
@@ -209,7 +214,7 @@ def load_samples(
 
     Mixed formats::
 
-        adata = load_samples(
+        adata = LoadSamples(
             {"cb":  "/data/cb/cellbender_out.h5",
              "raw": "/data/raw/filtered_feature_bc_matrix/"},
             format={"cb": "h5", "raw": "mtx"},
@@ -223,7 +228,7 @@ def load_samples(
         # format the format argument: if it's a dict, get the format for this sample; otherwise, use the same format for all samples.
         fmt = format[name] if isinstance(format, dict) else format
 
-        ad = load_sample(
+        ad = LoadSample(
             path,
             format=fmt,
             sample_name=name,
@@ -237,7 +242,7 @@ def load_samples(
     combined.obs_names_make_unique()
 
     logger.info(
-        "load_samples: %d samples -> %d cells x %d genes [join='%s'].",
+        "LoadSamples: %d samples -> %d cells x %d genes [join='%s'].",
         len(adatas), combined.n_obs, combined.n_vars, join,
     )
     return combined
@@ -290,7 +295,7 @@ def CatAdata(
 
 # ── I/O helpers ───────────────────────────────────────────────────────────────
 
-def _require_exists(path: Path) -> None:
+def _RequireExists(path: Path) -> None:
     """Raise FileNotFoundError if path does not exist."""
     if not path.exists():
         raise FileNotFoundError(

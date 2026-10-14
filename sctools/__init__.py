@@ -22,7 +22,7 @@ if not _sctools_logger.handlers:
     _sctools_logger.addHandler(_handler)
     _sctools_logger.setLevel(logging.INFO)
 
-from sctools.plots import PlotHeatmap, PlotSignificanceHeatmap
+from sctools.plots import PlotHeatmap, PlotSignificanceHeatmap, PlotSampleComposition
 from sctools.io import CatAdata
 from sctools.networks import FilterKnowledgeNetworks
 from sctools.scenic import (
@@ -69,10 +69,17 @@ from sctools.alra import RunAlraOnAnnData
 from sctools.mast import RunMAST, RunMASTByCelltype
 
 from sctools.annotation import (
+    MarkerInData,
+    RankGenesByCluster,
+    MeanExpressionByCluster,
+    PlotTopDegsHeatmap,
     CalculateModuleScores,
     PlotModuleScoresUMAPs,
     CalculateAUCellWithDecoupler,
     PlotAUCellUMAPs,
+    ScoreCellCycle,
+    AssignLabelsFromScores,
+    PlotFinalAnnotation,
 )
 
 from sctools.integration import (
@@ -137,6 +144,33 @@ from sctools.qc import (
     PlotQcBoxplots,
 )
 
+# py_hdWGCNA, gseapy and seaborn are imported inside these functions,
+# so this import works in environments without them.
+from sctools.hdwgcna import (
+    GetWgcnaPackageVersions,
+    SummarizeWgcnaInput,
+    PrepareWgcnaInput,
+    SelectWgcnaGenes,
+    BuildWgcnaMetacells,
+    SummarizeWgcnaMetacells,
+    SetWgcnaExpression,
+    CheckBicorMad,
+    TestWgcnaSoftPowers,
+    SelectWgcnaSoftPower,
+    PlotWgcnaSoftPowers,
+    BuildWgcnaNetwork,
+    FlagSmallWgcnaModules,
+    PlotWgcnaDendrogram,
+    ComputeWgcnaEigengenes,
+    PlotWgcnaModuleFeatures,
+    ComputeWgcnaKme,
+    PlotWgcnaKmes,
+    GetWgcnaHubGenes,
+    RunWgcnaEnrichr,
+    SelectSignificantEnrichment,
+    PlotWgcnaEnrichmentDotplot,
+)
+
 __all__ = [
     # I/O
     "CatAdata",
@@ -176,6 +210,7 @@ __all__ = [
     # Generic plots
     "PlotHeatmap",
     "PlotSignificanceHeatmap",
+    "PlotSampleComposition",
     # Preprocessing
     "NormalizeHvgPcaKnn",
     "CheckNormalizedLayer",
@@ -186,10 +221,17 @@ __all__ = [
     # Imputation
     "RunAlraOnAnnData",
     # Annotation
+    "MarkerInData",
+    "RankGenesByCluster",
+    "MeanExpressionByCluster",
+    "PlotTopDegsHeatmap",
     "CalculateModuleScores",
     "PlotModuleScoresUMAPs",
     "CalculateAUCellWithDecoupler",
     "PlotAUCellUMAPs",
+    "ScoreCellCycle",
+    "AssignLabelsFromScores",
+    "PlotFinalAnnotation",
     # Integration
     "RunSeuratAnchors",
     "PlotUmap",
@@ -243,4 +285,27 @@ __all__ = [
     "PlotQcHeatmap",
     "PlotQcThresholdsGrid",
     "PlotQcBoxplots",
+    # Co-expression networks (py_hdWGCNA)
+    "GetWgcnaPackageVersions",
+    "SummarizeWgcnaInput",
+    "PrepareWgcnaInput",
+    "SelectWgcnaGenes",
+    "BuildWgcnaMetacells",
+    "SummarizeWgcnaMetacells",
+    "SetWgcnaExpression",
+    "CheckBicorMad",
+    "TestWgcnaSoftPowers",
+    "SelectWgcnaSoftPower",
+    "PlotWgcnaSoftPowers",
+    "BuildWgcnaNetwork",
+    "FlagSmallWgcnaModules",
+    "PlotWgcnaDendrogram",
+    "ComputeWgcnaEigengenes",
+    "PlotWgcnaModuleFeatures",
+    "ComputeWgcnaKme",
+    "PlotWgcnaKmes",
+    "GetWgcnaHubGenes",
+    "RunWgcnaEnrichr",
+    "SelectSignificantEnrichment",
+    "PlotWgcnaEnrichmentDotplot",
 ]

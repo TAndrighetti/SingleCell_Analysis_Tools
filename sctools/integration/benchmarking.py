@@ -49,8 +49,12 @@ TAB_SCIB_SUBDIR = "tab_scib"
 # get the right metrics automatically -- each run's table only ever has the
 # columns it actually computed, and downstream filtering already drops the rest.
 BATCH_METRICS = ("PCR_batch", "iLISI", "ASW_label/batch", "graph_conn", "kBET")
+# hvg_overlap is left out on purpose: it is only computed for methods that
+# correct the expression matrix (see SCIB_CORRECTED_LAYER_BY_METHOD), so it
+# would enter the bio_score of some methods and not others. It is still saved
+# in the per-run metric CSVs as a diagnostic.
 BIO_METRICS = (
-    "cell_cycle_conservation", "hvg_overlap", "NMI_cluster/label", "ARI_cluster/label",
+    "cell_cycle_conservation", "NMI_cluster/label", "ARI_cluster/label",
     "ASW_label", "isolated_label_F1", "isolated_label_silhouette", "cLISI",
 )
 
@@ -136,11 +140,16 @@ def RunScibMetricsLabelFree(
     *,
     batch_key: str = "sample",
     embed: str = "X_pca",
+    hvg_score: bool = True,
 ):
     """
     scIB metrics that need no biological label: PCR_batch, iLISI, HVG
     overlap, cell-cycle conservation. Use when no cell-type label exists yet
     (the common case before integration).
+
+    hvg_score: compute hvg_overlap. Only meaningful when adata_int.X holds a
+    corrected expression matrix. For embedding-only methods, pass False
+    (hvg_overlap is then NaN), since their .X is the uncorrected input.
 
     Assumes an embedding-based integration method (type_="embed" is
     hardcoded below) -- this module doesn't currently support graph-based
@@ -164,7 +173,7 @@ def RunScibMetricsLabelFree(
     try:
         return sciblib.metrics.metrics(
             adata_ref, adata_int, batch_key=batch_key, label_key=None, embed=embed, organism=organism,
-            pcr_=True, ilisi_=True, hvg_score_=True, cell_cycle_=True,
+            pcr_=True, ilisi_=True, hvg_score_=hvg_score, cell_cycle_=True,
             silhouette_=False, isolated_labels_=False, nmi_=False, ari_=False, graph_conn_=False,
             type_="embed", verbose=False,
         )
@@ -177,7 +186,10 @@ def RunScibMetricsLabelFree(
             {
                 "PCR_batch": sciblib.metrics.pcr_comparison(adata_ref, adata_int, covariate=batch_key, embed=embed, verbose=False),
                 "iLISI": sciblib.metrics.ilisi_graph(adata_int, batch_key=batch_key, type_="embed", use_rep=embed),
-                "hvg_overlap": sciblib.metrics.hvg_overlap(adata_ref, adata_int, batch_key=batch_key),
+                "hvg_overlap": (
+                    sciblib.metrics.hvg_overlap(adata_ref, adata_int, batch_key=batch_key)
+                    if hvg_score else np.nan
+                ),
                 "cell_cycle_conservation": sciblib.metrics.cell_cycle(
                     adata_ref, adata_int, batch_key=batch_key, embed=embed, organism=organism, verbose=False,
                 ),
@@ -193,12 +205,15 @@ def RunScibMetricsWithLabel(
     *,
     batch_key: str = "sample",
     embed: str = "X_pca",
+    hvg_score: bool = True,
 ):
     """
     scIB metrics using a real biological label (`label_key`): adds ASW, NMI,
     ARI, isolated-labels, and graph-connectivity on top of the label-free
     metrics -- all genuine signals here, since `label_key` is an independent
     ground truth, not derived from the integration being scored.
+
+    hvg_score: same as in RunScibMetricsLabelFree.
 
     Assumes an embedding-based integration method (type_="embed" is
     hardcoded below) -- this module doesn't currently support graph-based
@@ -228,7 +243,7 @@ def RunScibMetricsWithLabel(
     # cells stayed distinguishable/connected/tight after integration.
     # n_cores speeds up that resolution search plus clisi_/kBET_ below.
     metric_kwargs = dict(
-        pcr_=True, ilisi_=True, hvg_score_=True, cell_cycle_=True, type_="embed", verbose=False,
+        pcr_=True, ilisi_=True, hvg_score_=hvg_score, cell_cycle_=True, type_="embed", verbose=False,
         silhouette_=True, isolated_labels_=True, nmi_=True, ari_=True, graph_conn_=True, n_cores=16,
     )
 
@@ -273,7 +288,8 @@ def RunIntegrationBenchmark(
 
     Metric mode:
         label_key=None (default): label-free metrics (PCR_batch, iLISI,
-            hvg_overlap, cell_cycle_conservation).
+            cell_cycle_conservation, and hvg_overlap only for methods in
+            SCIB_CORRECTED_LAYER_BY_METHOD).
         label_key="...": real biological label; adds ASW/NMI/ARI/graph
             connectivity/cLISI/kBET (where the scib version supports them).
 
@@ -435,18 +451,26 @@ def RunIntegrationBenchmark(
             # with type_="embed" internally -- no per-method lookup needed.
             embed = SCIB_EMBED_BY_METHOD[method]
 
-            # hvg_overlap/cell_cycle_conservation read adata_int.X, not
-            # obsm[embed] -- for embedding-only methods (harmony/scanorama/
-            # scvi) .X is legitimately still the pre-integration matrix (they
-            # never correct expression, so those two metrics are inherently
-            # near-1.0/uninformative for them, which is expected). Seurat DOES
-            # correct expression, but keeps it in adata.layers["seurat"] so
-            # the object can still be used for downstream neighbors/UMAP off
-            # X_pca -- swap .X to that corrected layer on a scoring-only copy
-            # so hvg_overlap/cell_cycle_conservation actually see Seurat's
-            # correction instead of silently scoring the untouched input.
+            # hvg_overlap reads only adata_int.X. For embedding-only methods
+            # (harmony/scanorama/scvi) .X is still the uncorrected input, so
+            # hvg_overlap is always exactly 1.0 for them. It is not computed
+            # for these methods (hvg_score=False below gives NaN).
+            #
+            # cell_cycle_conservation is different: the S/G2M scores come from
+            # adata_ref (full-gene), and the "after" PC regression runs on
+            # adata_int.obsm[embed]. So it is a real signal for
+            # embedding-only methods too.
+            #
+            # Seurat corrects expression, but keeps it in adata.layers["seurat"]
+            # so the object can still be used for downstream neighbors/UMAP
+            # off X_pca. Swap .X to that corrected layer on a scoring-only
+            # copy. With embed="X_pca", PCR_batch and iLISI use
+            # obsm["X_pca"] (the PCA of the corrected matrix), and
+            # cell_cycle_conservation uses .X (the corrected matrix itself),
+            # so all these metrics see Seurat's correction, not the untouched input.
             correction_layer = SCIB_CORRECTED_LAYER_BY_METHOD.get(method)
-            if correction_layer and correction_layer in adata_int.layers:
+            has_corrected_matrix = bool(correction_layer) and correction_layer in adata_int.layers
+            if has_corrected_matrix:
                 adata_scoring = adata_int.copy()
                 adata_scoring.X = adata_scoring.layers[correction_layer].copy()
             else:
@@ -457,10 +481,12 @@ def RunIntegrationBenchmark(
             if label_key is not None:
                 metrics_series = RunScibMetricsWithLabel(
                     adata_run, adata_scoring, organism, label_key, batch_key=batch_key, embed=embed,
+                    hvg_score=has_corrected_matrix,
                 )
             else:
                 metrics_series = RunScibMetricsLabelFree(
                     adata_run, adata_scoring, organism, batch_key=batch_key, embed=embed,
+                    hvg_score=has_corrected_matrix,
                 )
 
             col_name = f"{method}_{run_id}"

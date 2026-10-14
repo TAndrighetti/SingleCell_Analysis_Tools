@@ -16,8 +16,8 @@ pip install -e .
 
 | Function | Description |
 |---|---|
-| `load_sample` | Load a single sample (MTX or Cell Ranger H5) into AnnData |
-| `load_samples` | Load multiple samples and concatenate |
+| `LoadSample` | Load a single sample (MTX or Cell Ranger H5) into AnnData |
+| `LoadSamples` | Load multiple samples and concatenate |
 | `CatAdata` | Concatenate a dict or list of AnnData objects |
 
 ### `sctools.qc` — Quality control
@@ -62,6 +62,7 @@ pip install -e .
 |---|---|
 | `PlotHeatmap` | Generic heatmap with optional cell annotations |
 | `PlotSignificanceHeatmap` | Generic value+significance heatmap from a long-format table (color by a value column, "*" by a p-value/padj column, optional `restrict_to_significant` row filter, optional category sidebar) |
+| `PlotSampleComposition` | Stacked bars with the fraction of each cell type per sample/condition (optional pooled "All" bar, percentages inside/outside, horizontal), returns `(fig, ax)` |
 
 ### `sctools.preprocessing` — Normalization, HVG, PCA, kNN
 
@@ -80,10 +81,17 @@ pip install -e .
 
 | Function | Description |
 |---|---|
-| `CalculateModuleScores` | Per-signature module score (`sc.tl.score_genes`), normalized by sqrt(n_genes) |
-| `PlotModuleScoresUMAPs` | UMAP grid of module scores, diverging color scale centered at 0 |
-| `CalculateAUCellWithDecoupler` | Per-signature AUCell score (`decoupler.mt.aucell`), normalized by sqrt(n_genes) |
-| `PlotAUCellUMAPs` | UMAP grid of AUCell scores, sequential color scale from 0 |
+| `MarkerInData` | Keep marker genes present in the data (case-insensitive, returns the data spelling, e.g. `H2-ab1` -> `H2-Ab1`) |
+| `RankGenesByCluster` | Top Wilcoxon marker genes per cluster (optional prefix-based mt/ribo/hb filter, optional `specific_markers` via `sc.tl.filter_rank_genes_groups`) + z-scored mean expression per cluster |
+| `MeanExpressionByCluster` | Mean expression per cluster of any gene list or marker dict (`sc.get.aggregate`), optional per-gene z-score across clusters (`sc.pp.scale`). Used by `RankGenesByCluster` |
+| `PlotTopDegsHeatmap` | Heatmap of the z-scored top genes per cluster, returns `(fig, ax)` (`PlotTopDEGsHeatmap` kept as alias) |
+| `CalculateModuleScores` | Per-signature module score (`sc.tl.score_genes`). Sets with no valid gene -> NaN. Optional sqrt(n_genes) division (`normalize_by_sqrt_n`, off by default) |
+| `PlotModuleScoresUMAPs` | Embedding grid (UMAP by default, `basis=`) of module scores, diverging color scale centered at 0 |
+| `CalculateAUCellWithDecoupler` | Per-signature AUCell score (`decoupler.mt.aucell`), in [0, 1]. Sets not scored -> NaN. Optional sqrt(n_genes) division (`normalize_by_sqrt_n`, off by default) |
+| `PlotAUCellUMAPs` | Embedding grid (UMAP by default, `basis=`) of AUCell scores, sequential color scale from 0 |
+| `ScoreCellCycle` | S/G2M scores + phase (`sc.tl.score_genes_cell_cycle`, Tirosh et al. 2016 genes via `scib`, mouse orthologs). Evidence to split proliferating precursors from post-mitotic cells |
+| `AssignLabelsFromScores` | Cluster x signature table (median score) + per-cluster `top1`/`top2`/`margin`/`purity`/`suggested_label` ("ambiguous" below `min_purity`), and `frac_cycling` if `phase` exists |
+| `PlotFinalAnnotation` | Map {cluster: label} into an ordered `adata.obs` column, then UMAPs (clusters vs labels) + marker dotplot. Warns about clusters left without a label (NaN) |
 
 ### `sctools.integration` — Batch integration, clustering, benchmarking
 
@@ -174,10 +182,39 @@ pip install -e .
 | `RunReactorProcessData` | rpy2 bridge to `REACTOR::processData()`: percent of cells with each regulon active, per (sample, celltype) |
 | `RunReactorDifferentialActivityROTS` | rpy2 bridge to `REACTOR::differentialActivityAnalysis()` (ROTS); derives the positional `groups` vector from a `{sample: condition}` mapping instead of requiring it hand-built in column order |
 
+### `sctools.hdwgcna`: Co-expression networks (py_hdWGCNA)
+
+> Requires `py_hdWGCNA` (tested 0.1.0, needs R for the dynamic tree cut), `gseapy` for enrichment and `seaborn` for the dot plot. Tested in the `scRNA_NEW_signaling_py311` env. Read the "Design notes" in the module docstring before changing a default (counts layer, Pearson vs bicor, Harmony, enrichment background).
+
+| Function | Description |
+|---|---|
+| `GetWgcnaPackageVersions` | Versions of py_hdWGCNA, gseapy, scanpy and anndata, to print at the top of a notebook |
+| `SummarizeWgcnaInput` | Cells per group x sample and the condition of each sample (check before choosing `min_cells`); optional `group_order` |
+| `PrepareWgcnaInput` | Check obs columns, counts layer and embedding; optionally remove groups (e.g. a rare stage); copy the chosen counts (e.g. SoupX `QC_filtered`) to `layers['counts']`, the only layer py_hdWGCNA reads |
+| `SelectWgcnaGenes` | Genes detected in >= `fraction` of cells (hdWGCNA tutorial: 0.05) |
+| `BuildWgcnaMetacells` | Metacells per group (e.g. stage x sample), checks `max_shared < k`. Not reproducible: py_hdWGCNA has no seed |
+| `SummarizeWgcnaMetacells` | Cells and metacells per group (0 metacells = skipped by `min_cells`) |
+| `SetWgcnaExpression` | Metacell expression matrix of the chosen groups, warns about groups without metacells |
+| `CheckBicorMad` | Number of genes with MAD = 0 and median MAD: tells if bicor is safe (py_hdWGCNA replaces MAD = 0 by 1, R falls back to Pearson) |
+| `TestWgcnaSoftPowers` | Scale-free fit per soft power; the correlation method is saved and reused by the network |
+| `SelectWgcnaSoftPower` | Lowest power with `SFT.R.sq >= r2_cutoff` AND `slope < 0` (py_hdWGCNA stores R2 without sign) |
+| `PlotWgcnaSoftPowers` | Scale-free fit and connectivity plots per power (wrapper of `plot_soft_powers`) |
+| `BuildWgcnaNetwork` | Network (`network_type` reused from `TestWgcnaSoftPowers`, error if different), TOM (`tom_type`), modules, merging; returns module sizes |
+| `FlagSmallWgcnaModules` | Modules below the hdWGCNA default size (50), which exist only because of a smaller `min_module_size` |
+| `PlotWgcnaDendrogram` | Gene tree (1 - TOM) with module colors (wrapper of `plot_dendrogram`) |
+| `ComputeWgcnaEigengenes` | Module eigengenes per cell; `harmonize=False` by default (Harmony by sample removes part of the condition effect when condition is nested in sample) |
+| `PlotWgcnaModuleFeatures` | Eigengenes on an embedding given as obsm key (e.g. `'X_umap'`), one panel per module (wrapper of `module_feature_plot`) |
+| `ComputeWgcnaKme` | kME in the chosen cells: `sparse=True` (Pearson only, fast) or `sparse=False` (dense, allows bicor/spearman) |
+| `PlotWgcnaKmes` | kME per module with the top hub names (wrapper of `plot_kmes`) |
+| `GetWgcnaHubGenes` | Top genes per module by kME (wrapper of `get_hub_genes`) |
+| `RunWgcnaEnrichr` | Enrichr ORA per module (top genes by kME; stops if `ComputeWgcnaKme` was not run), network genes as background by default, `organism` required |
+| `SelectSignificantEnrichment` | Terms with adjusted p below a cutoff, sorted |
+| `PlotWgcnaEnrichmentDotplot` | Dot plot of the top terms per module for one database, returns `(fig, ax)` |
+
 ## Typical QC workflow
 
 ```python
-from sctools.io import load_sample, CatAdata
+from sctools.io import LoadSample, CatAdata
 from sctools.qc import (
     AmbientRNA, ScoreDoublets, CallDoublets, FilterDoublets,
     CalculateQcMetrics, EvaluateQcThresholds, FilterQcCells,
@@ -185,7 +222,7 @@ from sctools.qc import (
 )
 
 # 1. Load samples
-adatas = {name: load_sample(path, format="mtx", obs_meta={"sample": name})
+adatas = {name: LoadSample(path, format="mtx", obs_meta={"sample": name})
           for name, path in sample_paths.items()}
 
 # 2. Ambient RNA correction (SoupX)
@@ -286,19 +323,34 @@ all_metrics_df, params_df = RunIntegrationTests(
 
 ```python
 from sctools.annotation import (
+    MarkerInData, RankGenesByCluster, PlotTopDegsHeatmap,
     CalculateModuleScores, PlotModuleScoresUMAPs,
     CalculateAUCellWithDecoupler, PlotAUCellUMAPs,
+    ScoreCellCycle, AssignLabelsFromScores,
 )
 
+# 13b. Top marker genes per cluster (Wilcoxon, for ranking only) + heatmap
+cluster_genes, scaled_df = RankGenesByCluster(
+    adata, groupby="leiden_res1", layer="QC_filtered_log1p", filter_mt_ribo_hb=True,
+    specific_markers=True,  # in-group >25% cells, out-group <50%, log2FC >1
+)
+PlotTopDegsHeatmap(scaled_df, title="Top 10 DEGs per cluster")
+
 marker_genes_dic = {"Goblet": ["Muc2", "Tff3"], "Colonocyte": ["Slc26a3", "Car1"]}
+marker_genes_dic = MarkerInData(marker_genes_dic, adata)
 
 # 14. Module scores (sc.tl.score_genes) + UMAPs
 adata = CalculateModuleScores(adata, marker_genes_dic, layer="QC_filtered_log1p")
-PlotModuleScoresUMAPs(adata)
+PlotModuleScoresUMAPs(adata)  # basis="X_umap_harmony" to use another embedding
 
 # 15. AUCell scores (decoupler) + UMAPs
 adata = CalculateAUCellWithDecoupler(adata, marker_genes_dic, layer="QC_filtered_log1p")
 PlotAUCellUMAPs(adata)
+
+# 15b. Cell-cycle phase as extra evidence, then a suggested label per cluster
+adata = ScoreCellCycle(adata, organism="mouse", layer="QC_filtered_log1p")
+cluster_scores, summary = AssignLabelsFromScores(adata, groupby="leiden_res1", prefix="score_")
+summary  # top1, top2, margin, purity, suggested_label, frac_cycling
 ```
 
 ## Typical DEGs / hallmark activity workflow (pseudobulk PyDESeq2 + decoupler ULM)
@@ -351,6 +403,50 @@ heatmap_df, padj_df, annot_df = PlotSignificanceHeatmap(
     ulm_long, x="celltype", y="hallmark", value_col="score", pvalue_col="padj",
     restrict_to_significant=True, title="Hallmark activities (TREATED vs CTRL)",
 )
+```
+
+## Typical co-expression network workflow (hdWGCNA)
+
+Full tutorial with explanations: `tutoriais/07.hdWCGNA_tutorial.ipynb` (example data: bone marrow neutrophils of germ-free and SPF mice, Sheng et al. 2025).
+
+```python
+from sctools.hdwgcna import *
+
+stages = ["G0", "G1", "G2", "G3", "G4", "G5a", "G5c"]
+
+# 20. Inputs: SoupX counts in layers['counts'], remove a stage with too few cells
+cells_per_group, sample_conditions = SummarizeWgcnaInput(adata, "celltype", "sample", "condition")
+adata = PrepareWgcnaInput(
+    adata, counts_layer="QC_filtered", required_cols=["sample", "condition", "celltype"],
+    reduction="X_pca", group_col="celltype", exclude_groups=["G5b"],
+)
+
+# 21. Genes, metacells (per stage x sample) and the network matrix
+adata = SelectWgcnaGenes(adata, fraction=0.05)
+adata = BuildWgcnaMetacells(adata, group_by=["celltype", "sample"], ident_group="celltype", min_cells=90)
+adata = SetWgcnaExpression(adata, groups=stages, group_by="celltype")
+
+# 22. Correlation method and soft power
+print(CheckBicorMad(adata))               # many MAD = 0 genes -> pearson
+adata, power_table = TestWgcnaSoftPowers(adata, cor_method="pearson")
+power = SelectWgcnaSoftPower(adata, r2_cutoff=0.80)
+PlotWgcnaSoftPowers(adata, selected_power=power)
+
+# 23. Network and modules
+adata, module_sizes = BuildWgcnaNetwork(adata, power=power, network_type="signed")   # min_module_size=50 (default)
+print(FlagSmallWgcnaModules(module_sizes, min_size=50))
+PlotWgcnaDendrogram(adata)
+
+# 24. Eigengenes (no Harmony: each sample is only WT or only KO) and kME
+adata, mes = ComputeWgcnaEigengenes(adata, layer="QC_filtered_log1p", harmonize=False)
+adata, modules_df = ComputeWgcnaKme(adata, group_by="celltype", groups=stages, layer="QC_filtered_log1p")
+hub_genes = GetWgcnaHubGenes(adata, n_hubs=10)
+
+# 25. GO enrichment with the network genes as background
+databases = ["GO_Biological_Process_2023", "GO_Molecular_Function_2023"]
+enrichment_df = RunWgcnaEnrichr(adata, databases=databases, organism="mouse", background="network")
+enrichment_sig = SelectSignificantEnrichment(enrichment_df, padj_cutoff=0.05)
+fig, ax = PlotWgcnaEnrichmentDotplot(enrichment_df, database=databases[0])
 ```
 
 ## Requirements

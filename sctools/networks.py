@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 
-def _normalize_network_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _NormalizeNetworkColumns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize a prior-knowledge network table to this module's internal
     column convention (source_genesymbol, target_genesymbol,
@@ -75,7 +75,7 @@ def FilterKnowledgeNetworks(
         column convention (source_genesymbol, target_genesymbol,
         is_stimulation, is_inhibition) or decoupler's `dc.op.*` wrapper
         convention (source, target, weight) is accepted -- see
-        `_normalize_network_columns`. Only the table(s) requested in
+        `_NormalizeNetworkColumns`. Only the table(s) requested in
         `networks` need to be given.
     networks : which network(s) to filter and concatenate.
 
@@ -86,8 +86,8 @@ def FilterKnowledgeNetworks(
     interaction_type ("ppi" / "tri").
     """
     tables = {
-        "ppi": _normalize_network_columns(ppi) if ppi is not None else None,
-        "tri": _normalize_network_columns(tri) if tri is not None else None,
+        "ppi": _NormalizeNetworkColumns(ppi) if ppi is not None else None,
+        "tri": _NormalizeNetworkColumns(tri) if tri is not None else None,
     }
 
     # a bare string is iterable character-by-character in Python, so

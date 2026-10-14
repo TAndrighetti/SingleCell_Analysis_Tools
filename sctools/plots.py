@@ -9,16 +9,18 @@ PlotHeatmap             – generic heatmap from a long-format DataFrame
 PlotSignificanceHeatmap – generic value+significance heatmap (score/log2FC
                           colored, "*" by p-value/padj threshold, optional
                           category sidebar) from a long-format DataFrame
-plot_qc_violins       – violin grid per QC metric, grouped by sample
-plot_metric_pairs     – paired boxplot comparing two AnnData sets (before/after)
-plot_covariates       – 4-panel covariate overview (violin × 3 + scatter)
-plot_doublet_umap     – UMAP colored by Scrublet doublet score and prediction
+PlotQcViolins           – violin grid per QC metric, grouped by sample
+PlotMetricPairs         – paired boxplot comparing two AnnData sets (before/after)
+PlotCovariates          – 4-panel covariate overview (violin × 3 + scatter)
+PlotDoubletUmap         – UMAP colored by Scrublet doublet score and prediction
+PlotSampleComposition   – stacked bars with the fraction of each cell type per sample
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -313,7 +315,7 @@ def PlotSignificanceHeatmap(
 
 # ── QC violins ────────────────────────────────────────────────────────────────
 
-def plot_qc_violins(
+def PlotQcViolins(
     adata: AnnData,
     metrics: list[str] | None = None,
     *,
@@ -430,7 +432,7 @@ def plot_qc_violins(
 
 # ── Paired boxplot ─────────────────────────────────────────────────────────────
 
-def plot_metric_pairs(
+def PlotMetricPairs(
     adatas_before: list[AnnData],
     adatas_after: list[AnnData],
     sample_names: list[str],
@@ -575,7 +577,7 @@ def plot_metric_pairs(
 
 # ── Covariate overview ─────────────────────────────────────────────────────────
 
-def plot_covariates(
+def PlotCovariates(
     adata: AnnData,
     label: str,
     *,
@@ -637,7 +639,7 @@ def plot_covariates(
 
 # ── Doublet UMAP ───────────────────────────────────────────────────────────────
 
-def plot_doublet_umap(
+def PlotDoubletUmap(
     adata: AnnData,
     *,
     threshold: float = 0.25,
@@ -696,3 +698,230 @@ def plot_doublet_umap(
                      dpi=300, bbox_inches="tight")
     if not show_plot:
         plt.close(fig2)
+
+
+# ── Sample composition (stacked bars) ─────────────────────────────────────────
+
+def _TextColorForBackground(color) -> str:
+    """White or black text, depending on the luminance of the background color."""
+    r, g, b = mcolors.to_rgb(color)
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    return "white" if luminance < 0.5 else "black"
+
+
+def PlotSampleComposition(
+    adata: AnnData,
+    celltype_col: str = "manual_celltype_annotation",
+    sample_col: str = "Sample",
+    figsize: tuple[float, float] = (10, 6),
+    palette: dict | list | None = None,
+    bar_width: float = 0.9,
+    bar_spacing: float = 0.15,
+    title_legend: str | None = "",
+    include_all: bool = True,
+    x_rotation: float = 0,
+    x_ticks: list[str] | None = None,
+    horizontal: bool = False,
+    show_pct: bool = False,
+    pct_fontsize: float = 8,
+    pct_min: float = 0.03,
+    pct_position: str = "inside",
+    pct_outside_side: str = "above",
+    pct_outside_margin: float = 0.05,
+    pct_outside_step: float = 0.07,
+    frameon: bool = True,
+    show: bool = True,
+    save_path: str | Path | None = None,
+) -> tuple:
+    """Stacked bars with the fraction of each cell type per sample.
+
+    Parameters
+    ----------
+    adata : AnnData object.
+    celltype_col : obs column with the cell-type labels (bar segments, colors).
+    sample_col : obs column with the groups (one bar per group), e.g. sample
+        or condition.
+    figsize : figure size.
+    palette : {cell type: color}, or a list of colors in the category order
+        of `celltype_col` (e.g. ``list(adata.uns["celltype_colors"])``).
+        ``None`` uses "tab10". Cell types without a color are drawn gray.
+    bar_width : bar width.
+    bar_spacing : space between bars.
+    title_legend : legend title. ``""`` (default) means no title, ``None``
+        uses `celltype_col`.
+    include_all : add one extra bar "All" with all cells pooled.
+    x_rotation : rotation of the sample tick labels.
+    x_ticks : tick labels. ``None`` uses the sample names (plus "All").
+    horizontal : horizontal bars instead of vertical.
+    show_pct : write the percentage of each segment.
+    pct_fontsize : font size of the percentages.
+    pct_min : minimum segment fraction to get a label.
+    pct_position : "inside" (centered in each segment) or "outside" (all
+        labels outside the bar, above or below it, never mixed).
+    pct_outside_side : "above" or "below", only for ``pct_position="outside"``.
+    pct_outside_margin : distance between the bar edge and the outside labels.
+    pct_outside_step : space between stacked outside labels of the same bar
+        (vertical bars only).
+    frameon : if False, remove the frame (spines) around the plot.
+    show : display the figure.
+    save_path : path to save the figure.
+
+    Returns
+    -------
+    fig, ax
+
+    Notes
+    -----
+    Domain note: the "All" bar pools all cells, so large samples weigh more
+    than small ones. It is not the mean of the per-sample fractions.
+
+    Domain note: cell-type fractions are compositional (they sum to 1), so
+    one type going up forces others down. This plot is descriptive; to test
+    composition changes between conditions, use a compositional model such
+    as scCODA (Buttner et al. 2021), with samples as replicates.
+    """
+    # Counts and fractions per sample
+    ctab = pd.crosstab(adata.obs[sample_col], adata.obs[celltype_col])
+    ctab_frac = ctab.div(ctab.sum(axis=1), axis=0)
+    ctab_frac = ctab_frac.sort_index()
+
+    # Extra "All" bar with all cells pooled
+    if include_all:
+        all_counts = ctab.sum(axis=0)
+        all_frac = (all_counts / all_counts.sum()).to_frame().T
+        all_frac.index = ["All"]
+        ctab_frac = pd.concat([ctab_frac, all_frac])
+
+    # Colors
+    if palette is None:
+        tab10 = plt.get_cmap("tab10")
+        palette = {ct: tab10(i % 10) for i, ct in enumerate(ctab_frac.columns)}
+    elif isinstance(palette, list):
+        categories = pd.Categorical(adata.obs[celltype_col]).categories
+        palette = dict(zip(categories, palette))
+
+    fig, ax = plt.subplots(figsize=figsize)
+    samples = ctab_frac.index.tolist()
+    x_pos = np.arange(len(samples)) * (1 + bar_spacing)
+
+    max_outside_count = 0
+
+    for i, sample in enumerate(samples):
+        bottom = 0
+        outside_count = 0
+        for celltype in ctab_frac.columns:
+            height = ctab_frac.loc[sample, celltype]
+            color = palette.get(celltype, "gray")
+
+            if horizontal:
+                ax.barh(y=x_pos[i], width=height, left=bottom, height=bar_width,
+                        color=color, edgecolor="black", linewidth=0.2)
+            else:
+                ax.bar(x=x_pos[i], height=height, bottom=bottom, width=bar_width,
+                       color=color, edgecolor="black", linewidth=0.2)
+
+            if show_pct and height >= pct_min:
+                label = f"{height * 100:.1f}%"
+                seg_center = bottom + height / 2
+
+                if pct_position == "inside":
+                    text_color = _TextColorForBackground(color)
+                    if horizontal:
+                        ax.text(seg_center, x_pos[i], label, ha="center", va="center",
+                                fontsize=pct_fontsize, color=text_color)
+                    else:
+                        ax.text(x_pos[i], seg_center, label, ha="center", va="center",
+                                fontsize=pct_fontsize, color=text_color)
+                else:
+                    # "outside": every label goes outside the bar, no guide line
+                    if horizontal:
+                        # Labels of one bar stay aligned with their segment,
+                        # only shifted above or below the bar
+                        row_offset = bar_width / 2 + pct_outside_margin
+                        label_y = x_pos[i] - row_offset if pct_outside_side == "above" else x_pos[i] + row_offset
+                        ax.text(seg_center, label_y, label, ha="center", va="center",
+                                fontsize=pct_fontsize, color="black")
+                    else:
+                        # No side space on vertical bars, so the outside labels
+                        # of one bar are stacked in a column
+                        stack_offset = pct_outside_margin + outside_count * pct_outside_step
+                        label_y = 1.0 + stack_offset if pct_outside_side == "above" else -stack_offset
+                        ax.text(x_pos[i], label_y, label, ha="center", va="center",
+                                fontsize=pct_fontsize, color="black")
+                        outside_count += 1
+
+            bottom += height
+
+        max_outside_count = max(max_outside_count, outside_count)
+
+    if x_ticks is None:
+        x_ticks = samples
+
+    # Fix the category axis to the real bar size (bar_width + fixed margin).
+    # Without it, autoscale zooms on the data range: a smaller bar_spacing
+    # shrinks the range and matplotlib enlarges everything to fill figsize,
+    # which hides most of the expected visual effect.
+    axis_min = x_pos[0] - bar_width / 2 - 0.1
+    axis_max = x_pos[-1] + bar_width / 2 + 0.1
+
+    outside_active = show_pct and pct_position == "outside"
+
+    if horizontal and outside_active:
+        row_offset = bar_width / 2 + pct_outside_margin
+        if pct_outside_side == "above":
+            axis_min = min(axis_min, x_pos[0] - row_offset - 0.05)
+        else:
+            axis_max = max(axis_max, x_pos[-1] + row_offset + 0.05)
+
+    # Fraction axis limits (0-1). With stacked outside labels on vertical bars,
+    # the axis grows to fit the label column above or below the bar.
+    frac_axis_min = 0.0
+    frac_axis_max = 1.0
+    if (not horizontal) and outside_active and max_outside_count > 0:
+        stack_extent = pct_outside_margin + (max_outside_count - 1) * pct_outside_step + 0.05
+        if pct_outside_side == "above":
+            frac_axis_max = 1.0 + stack_extent
+        else:
+            frac_axis_min = -stack_extent
+
+    # Axes style
+    if horizontal:
+        ax.set_yticks(x_pos)
+        ax.set_yticklabels(x_ticks, rotation=x_rotation)
+        ax.set_ylim(axis_min, axis_max)
+        ax.invert_yaxis()  # first sample on top
+        ax.set_xlim(0, 1.0)
+        ax.set_xlabel("Fraction of cells")
+    else:
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(x_ticks, rotation=x_rotation)
+        ax.set_xlim(axis_min, axis_max)
+        ax.set_ylim(frac_axis_min, frac_axis_max)
+        ax.set_ylabel("Fraction of cells")
+    ax.grid(False)
+
+    if not frameon:
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    # Legend
+    legend_labels = ctab_frac.columns.tolist()
+    if title_legend is None:
+        title_legend = celltype_col.replace("_", " ").capitalize()
+
+    ax.legend(handles=[plt.Rectangle((0, 0), 1, 1, color=palette.get(c, "gray")) for c in legend_labels],
+              labels=legend_labels,
+              title=title_legend,
+              bbox_to_anchor=(1.05, 1),
+              loc="upper left")
+
+    fig.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    return fig, ax
