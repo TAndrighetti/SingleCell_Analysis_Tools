@@ -18,6 +18,7 @@ Typical usage order:
     PrepareULMInput()              -> optional: build one celltype's ULM input from a long-format DE table (e.g. reloaded from CSV in a separate notebook); skip this if you still have `PseudoDESeq2`'s `data` in memory
     RunULM()                       -> run ULM for ONE input against any net, + optional barplot (pass `ax=` for a grid)
     RunGSEAByCelltype()            -> GSEA (ranked by DE stat) for every celltype of a long-format DE table, returns a long table for PlotSignificanceHeatmap
+    RunPrerankByCelltype()         -> same as RunGSEAByCelltype, but with gseapy prerank (Broad FDR). Use it for large collections (GO, Reactome)
     MeltActsPadjToLong()           -> combine several celltypes' stored acts/padj into one tidy table
     BuildSignificantFeatureTable() -> long-format table restricted to significant hits, + category/direction columns
     SummarizeFeatureCategories()   -> per-celltype/category summary from that table
@@ -83,6 +84,7 @@ so `SelectTopCorrelatedGenes` works on its `correlation_table` unchanged.
 
 from __future__ import annotations
 
+import json
 import logging
 import warnings
 from collections.abc import Sequence
@@ -103,6 +105,7 @@ __all__ = [
     "PrepareULMInput",
     "RunULM",
     "RunGSEAByCelltype",
+    "RunPrerankByCelltype",
     "MeltActsPadjToLong",
     "BuildSignificantFeatureTable",
     "SummarizeFeatureCategories",
@@ -111,7 +114,23 @@ __all__ = [
     "CalculateGeneProfileCorrelations",
     "CalculateGeneCellCorrelations",
     "SelectTopCorrelatedGenes",
+    "LoadHallmarkCategories",
 ]
+
+
+def LoadHallmarkCategories(
+    path: str | Path = "/home/tahila/0.resources/hallmark_categories.json",
+) -> dict[str, list[str]]:
+    """
+    Load the hallmark category map used to group ULM and GSEA heatmaps.
+
+    Reads a JSON file of {category: [hallmark names]}, so the categories can be
+    edited without touching the notebook. The order of the categories and of
+    the hallmarks in each one is kept, and it sets the row order of the heatmaps.
+    """
+    with open(path) as f:
+        return json.load(f)
+
 
 #####################################################################
 #### ULM Enrichment
@@ -412,6 +431,110 @@ def RunGSEAByCelltype(
             "permutations. Consider times >= %d.",
             n_zero, times, times, n_tested, suggested,
         )
+
+    gsea_long["direction"] = np.select(
+        [gsea_long["NES"] > 0, gsea_long["NES"] < 0],
+        [compare_condition, normal_condition],
+        default=None,
+    )
+    return gsea_long
+
+
+def RunPrerankByCelltype(
+    de_long: pd.DataFrame,
+    net: pd.DataFrame,
+    *,
+    contrast_name: str = "KO.vs.WT",
+    celltype_col: str = "celltype",
+    gene_col: str = "gene_id",
+    value_col: str = "stat",
+    celltypes: Sequence[str] | None = None,
+    permutation_num: int = 1000,
+    min_size: int = 15,
+    max_size: int = 500,
+    seed: int = 42,
+    threads: int = 4,
+) -> pd.DataFrame:
+    """
+    Run gseapy prerank GSEA per celltype on a long-format DE table.
+
+    Same input and output as `RunGSEAByCelltype`, but with the original
+    Broad GSEA statistics. Use it for large collections (GO, Reactome).
+
+    Why: `RunGSEAByCelltype` (decoupler) gives each pathway its own
+    permutation p-value, so with m pathways it needs times > 2*m/0.05
+    permutations (about 200000 for GO BP). gseapy computes the FDR from the
+    NES null distribution pooled across all pathways (Broad method), so
+    1000 permutations are enough. `padj` is this FDR q-value. It is computed
+    across the pathways of one celltype (not across celltypes). Its lowest
+    value is 1/permutation_num.
+
+    Genes are ranked by `value_col` inside each celltype (default "stat",
+    the DESeq2 Wald statistic). Genes with NaN in `value_col` are dropped.
+
+    Parameters
+    ----------
+    de_long : long-format DE table, one row per (celltype, gene).
+    net : decoupler-style network with columns "source" (pathway) and
+        "target" (gene), the same format `RunGSEAByCelltype` takes.
+    contrast_name : "{compare_condition}.vs.{normal_condition}". Used for
+        the `direction` column.
+    celltype_col, gene_col, value_col : columns of `de_long`.
+    celltypes : celltypes to run. If None, all in `de_long` (order of appearance).
+    permutation_num : number of gene set permutations.
+    min_size, max_size : pathway size limits, counted on the genes present
+        in the ranking (gseapy defaults, 15 and 500).
+    seed : random seed for the permutations.
+    threads : number of threads for gseapy.
+
+    Returns
+    -------
+    DataFrame with columns: celltype_col, pathway, NES, pval, padj,
+    lead_genes, direction. `pval` is the nominal p-value, `padj` the FDR
+    q-value, `lead_genes` the leading edge genes (";"-separated).
+    `direction` is compare_condition when NES > 0, normal_condition when
+    NES < 0, NaN otherwise.
+    """
+    import gseapy as gp
+
+    compare_condition, normal_condition = contrast_name.split(".vs.")
+
+    if celltypes is None:
+        celltypes = list(pd.unique(de_long[celltype_col]))
+
+    gene_sets = net.groupby("source")["target"].apply(list).to_dict()
+    ranked = de_long.dropna(subset=[value_col])
+
+    results = []
+    for celltype in celltypes:
+        logger.info("Prerank GSEA: %s", celltype)
+        rnk = ranked.loc[ranked[celltype_col] == celltype].set_index(gene_col)[value_col]
+
+        res = gp.prerank(
+            rnk=rnk,
+            gene_sets=gene_sets,
+            min_size=min_size,
+            max_size=max_size,
+            permutation_num=permutation_num,
+            seed=seed,
+            threads=threads,
+            outdir=None,
+            no_plot=True,
+            verbose=False,
+        ).res2d
+
+        # gseapy returns ES/NES as object dtype
+        gsea_df = pd.DataFrame({
+            celltype_col: celltype,
+            "pathway": res["Term"].to_numpy(),
+            "NES": pd.to_numeric(res["NES"]).to_numpy(),
+            "pval": pd.to_numeric(res["NOM p-val"]).to_numpy(),
+            "padj": pd.to_numeric(res["FDR q-val"]).to_numpy(),
+            "lead_genes": res["Lead_genes"].to_numpy(),
+        })
+        results.append(gsea_df.sort_values("NES", ascending=False))
+
+    gsea_long = pd.concat(results, ignore_index=True)
 
     gsea_long["direction"] = np.select(
         [gsea_long["NES"] > 0, gsea_long["NES"] < 0],

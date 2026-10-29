@@ -16,6 +16,7 @@ Typical usage order:
     GetWgcnaPackageVersions()      -- versions of py_hdWGCNA and gseapy (for the record)
     SummarizeWgcnaInput()          -- cells per group x sample, sample -> condition
     PrepareWgcnaInput()            -- check inputs, put the chosen counts in layers['counts']
+    GetCommonWgcnaGenes()          -- genes detected in >= 5% of cells in every condition (optional)
     SelectWgcnaGenes()             -- genes detected in >= 5% of cells
     BuildWgcnaMetacells()          -- metacells per group x sample
     SummarizeWgcnaMetacells()      -- cells and metacells per group
@@ -154,6 +155,7 @@ __all__ = [
     "GetWgcnaPackageVersions",
     "SummarizeWgcnaInput",
     "PrepareWgcnaInput",
+    "GetCommonWgcnaGenes",
     "SelectWgcnaGenes",
     "BuildWgcnaMetacells",
     "SummarizeWgcnaMetacells",
@@ -173,7 +175,12 @@ __all__ = [
     "RunWgcnaEnrichr",
     "SelectSignificantEnrichment",
     "PlotWgcnaEnrichmentDotplot",
+    "ExportWgcnaToCytoscape",
+    "EvaluateWgcnaCytoscapeFilters",
+    "PrepareWgcnaPreservationInputs",
+    "RunWgcnaModulePreservation"
 ]
+
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -338,12 +345,56 @@ def PrepareWgcnaInput(
 
 # ── Genes and metacells ───────────────────────────────────────────────────────
 
-def SelectWgcnaGenes(adata, fraction=0.05, wgcna_name='hdWGCNA'):
+def GetCommonWgcnaGenes(adatas, fraction=0.05):
+    """Genes detected in at least `fraction` of the cells in EVERY object.
+
+    Same rule as `SelectWgcnaGenes` (counts > 0 in `layers['counts']`), but
+    applied to each object separately (e.g. one object per condition). Pass
+    the result as `genes_use` to `SelectWgcnaGenes`, so independent networks
+    start from the same genes in the same order.
+
+    Parameters
+    ----------
+    adatas : dict {name: AnnData}, each prepared with `PrepareWgcnaInput`.
+    fraction : minimum fraction of cells with counts > 0.
+
+    Returns
+    -------
+    genes : list of common genes, in the gene order of the first object.
+    n_genes : pd.Series, genes passing the filter in each object and 'common'.
+    """
+    detected = {}
+    for name, adata in adatas.items():
+        if 'counts' not in adata.layers:
+            raise KeyError(f"{name!r} has no layers['counts']. Run PrepareWgcnaInput() first.")
+        # Same rule as py_hdWGCNA setup_for_wgcna(gene_select='fraction').
+        frac = np.asarray((adata.layers['counts'] > 0).sum(axis=0)).ravel() / adata.n_obs
+        detected[name] = set(adata.var_names[frac >= fraction])
+
+    common = set.intersection(*detected.values())
+    genes = [g for g in next(iter(adatas.values())).var_names if g in common]
+    n_genes = pd.Series(
+        {**{name: len(g) for name, g in detected.items()}, 'common': len(genes)},
+        name='n_genes',
+    )
+    return genes, n_genes
+
+
+def SelectWgcnaGenes(adata, fraction=0.05, wgcna_name='hdWGCNA', genes_use=None):
     """Keep genes detected in at least `fraction` of the cells (hdWGCNA tutorial: 0.05).
 
     The fraction is computed by py_hdWGCNA on `layers['counts']` (see
     `PrepareWgcnaInput`), over all cells together. Do not pre-filter genes
     by differential expression: WGCNA expects the full set of expressed genes.
+
+    genes_use : optional list of genes used instead of the fraction filter,
+        e.g. from `GetCommonWgcnaGenes` to compare independent networks. The
+        genes must be in this object, in its gene order, because the network
+        follows `adata.var_names`. `fraction` is then not applied again, only
+        recorded: pass the value used to build the list.
+
+    The final network genes are set later by `SetWgcnaExpression`, which
+    removes genes with zero variance in the selected metacells.
 
     Returns
     -------
@@ -351,13 +402,37 @@ def SelectWgcnaGenes(adata, fraction=0.05, wgcna_name='hdWGCNA'):
     """
     from py_hdWGCNA.core import setup_for_wgcna
 
-    adata = setup_for_wgcna(
-        adata,
-        gene_select='fraction',
-        fraction=fraction,
-        wgcna_name=wgcna_name,
-    )
-    _RecordParams(adata, wgcna_name, 'SelectWgcnaGenes', {'fraction': fraction})
+    if genes_use is None:
+        adata = setup_for_wgcna(
+            adata,
+            gene_select='fraction',
+            fraction=fraction,
+            wgcna_name=wgcna_name,
+        )
+    else:
+        genes_use = list(genes_use)
+        # py_hdWGCNA silently drops missing genes and uses ALL genes if the list is empty.
+        requested = set(genes_use)
+        if not genes_use or [g for g in adata.var_names if g in requested] != genes_use:
+            raise ValueError(
+                'genes_use must be a non-empty list of unique genes of this object, '
+                'in the order of adata.var_names.'
+            )
+        adata = setup_for_wgcna(
+            adata,
+            gene_select='custom',
+            genes_use=genes_use,
+            wgcna_name=wgcna_name,
+        )
+
+    # 'genes_use' is the list read by the next steps.
+    genes_kept = list(_GetWgcnaData(adata, wgcna_name)['genes_use'])
+    _RecordParams(adata, wgcna_name, 'SelectWgcnaGenes', {
+        'fraction': fraction,
+        'gene_select': 'fraction' if genes_use is None else 'custom',
+        'n_genes': len(genes_kept),
+        'genes_use': genes_kept,
+    })
     return adata
 
 
@@ -1126,3 +1201,1027 @@ def PlotWgcnaEnrichmentDotplot(
     sns.despine(ax=ax)
     fig.tight_layout()
     return fig, ax
+
+
+
+# -------
+def ExportWgcnaToCytoscape(
+    adata,
+    output_dir,
+    *,
+    condition_col='condition',
+    prefix='hdWGCNA',
+    n_hubs=None,
+    min_tom=0.0,
+    top_connections=None,
+    edge_scope='all',
+    include_module_nodes=True,
+    wgcna_name='hdWGCNA',
+):
+    """Export stored hdWGCNA results to Cytoscape TSV tables.
+
+    adata : AnnData for one condition; results must include modules and kME.
+    output_dir : destination folder; existing files with the same names are replaced.
+    condition_col : obs column containing exactly one nonmissing condition.
+    prefix : filename prefix; the condition is appended automatically.
+    n_hubs : None or 0 exports every assigned gene; positive integers select
+        the top N per module using stored own-module kME. No kME is recomputed.
+    min_tom : export gene pairs with TOM > min_tom (0 keeps all positive weights).
+        This filters edges only, retains all selected nodes, and is not a p-value.
+    top_connections : None keeps every eligible pair. A positive integer keeps
+        each selected gene's strongest K eligible TOM connections. An undirected
+        edge survives if either endpoint selects it, so degree may exceed K.
+        Ties are broken by partner gene name. Ranking uses only selected genes
+        within edge_scope and above min_tom, not all original network genes.
+    edge_scope : 'all' includes between-module pairs; 'intramodular' restricts
+        candidate edges to genes in the same module. Modules will then have no
+        between-module edges by construction, not as evidence of independence.
+    include_module_nodes : include module nodes and a separate membership edge file.
+    wgcna_name : name of the stored hdWGCNA analysis.
+
+    Returns a dict containing the exported DataFrames under 'nodes',
+    'gene_edges' and 'membership_edges', plus exported counts. Membership is
+    None when include_module_nodes=False. Records arguments and counts in
+    sctools_params. Gene IDs remain their gene names; module IDs are their
+    module names. Import independent conditions into separate Cytoscape
+    collections. Gene edges are undirected, once per pair, without self-loops.
+    Sparsified edge counts and degree are visualization properties. Interpret
+    connectivity using full-network metrics, not the imposed top-K graph.
+    The returned edge table resides in memory. The function does not copy the
+    full TOM or recalculate the network, eigengenes or kME, and does not reread
+    the TSV files to build the returned DataFrames.
+    """
+    from pathlib import Path
+
+    import numpy as np
+    import pandas as pd
+
+    wd = adata.uns['hdWGCNA'][wgcna_name]
+    labels = adata.obs[condition_col]
+    if labels.isna().any() or labels.nunique() != 1:
+        raise ValueError('adata must contain exactly one nonmissing condition.')
+    condition = str(labels.iloc[0])
+
+    if n_hubs is not None and (
+        isinstance(n_hubs, (bool, np.bool_))
+        or not isinstance(n_hubs, (int, np.integer))
+        or n_hubs < 0
+    ):
+        raise ValueError('n_hubs must be None or a nonnegative integer.')
+    if not np.isfinite(min_tom) or not 0 <= min_tom <= 1:
+        raise ValueError('min_tom must be between 0 and 1.')
+    if top_connections is not None and (
+        isinstance(top_connections, (bool, np.bool_))
+        or not isinstance(top_connections, (int, np.integer))
+        or top_connections < 1
+    ):
+        raise ValueError('top_connections must be None or a positive integer.')
+    if edge_scope not in ('all', 'intramodular'):
+        raise ValueError("edge_scope must be 'all' or 'intramodular'.")
+
+    # All inputs come from the object's stored results, not notebook variables.
+    genes = wd['modules_df'].loc[
+        wd['modules_df']['module'].ne('grey')
+    ].copy().reset_index(drop=True)
+    if genes.empty:
+        raise ValueError('No genes assigned to non-grey modules.')
+
+    # Read each gene's association with its own module.
+    genes['kME'] = np.nan
+    for module in genes['module'].unique():
+        column = f'kME_{module}'
+        if column not in genes:
+            raise ValueError(f'{column} is missing. Run ComputeWgcnaKme first.')
+        mask = genes['module'].eq(module)
+        genes.loc[mask, 'kME'] = genes.loc[mask, column]
+
+    if n_hubs:
+        genes = (
+            genes.sort_values(
+                ['module', 'kME', 'gene_name'], ascending=[True, False, True]
+            )
+            .groupby('module', observed=True, sort=False)
+            .head(n_hubs)
+        )
+    genes = genes.reset_index(drop=True)
+    names = genes['gene_name'].astype(str).to_numpy()
+    module_names = genes['module'].astype(str).to_numpy()
+
+    # Matrix axes follow dat_expr_genes, not necessarily modules_df row order.
+    gene_order = pd.Index(wd['dat_expr_genes'])
+    positions = gene_order.get_indexer(genes['gene_name'])
+    if (positions < 0).any():
+        raise ValueError('An exported gene is absent from dat_expr_genes.')
+
+    matrix_key = 'TOM' if 'TOM' in wd else 'tom_dissim'
+    matrix = np.asarray(wd[matrix_key])
+    if matrix.shape != (len(gene_order), len(gene_order)):
+        raise ValueError('TOM dimensions do not match dat_expr_genes.')
+    if not pd.Index(names).is_unique:
+        raise ValueError('Exported gene IDs must be unique.')
+    if include_module_nodes and set(names).intersection(module_names):
+        raise ValueError('Gene/module IDs collide. Use include_module_nodes=False.')
+
+    nodes = pd.DataFrame({
+        'id': names,
+        'label': names,
+        'node_type': 'gene',
+        'condition': condition,
+        'module': module_names,
+        'color': genes['color'].to_numpy(),
+        'kME': genes['kME'].to_numpy(),
+    })
+    n_modules = int(genes['module'].nunique())
+    if include_module_nodes:
+        module_nodes = (
+            genes[['module', 'color']].drop_duplicates('module')
+            .assign(
+                id=lambda x: x['module'].astype(str),
+                label=lambda x: x['module'].astype(str),
+                node_type='module', condition=condition,
+            )
+        )
+        nodes = pd.concat([nodes, module_nodes], ignore_index=True)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f'{prefix}_{condition}'
+    files = {
+        'nodes': output_dir / f'{stem}_nodes.tsv',
+        'gene_edges': output_dir / f'{stem}_gene_edges.tsv',
+    }
+    nodes.to_csv(files['nodes'], sep='\t', index=False)
+
+    if top_connections is not None:
+        # Store only the union of top-K pairs, not all eligible gene pairs.
+        n = len(genes)
+        pairs = set()
+        all_indices = np.arange(n)
+        for i, position in enumerate(positions):
+            candidates = (
+                np.flatnonzero(module_names == module_names[i])
+                if edge_scope == 'intramodular' else all_indices
+            )
+            weights = matrix[position, positions[candidates]]
+            if matrix_key == 'tom_dissim':
+                weights = 1.0 - weights
+            keep = np.isfinite(weights) & (weights > min_tom) & (candidates != i)
+            partners = candidates[keep]
+            ranked = np.lexsort((names[partners], -weights[keep]))
+            for j in partners[ranked[:top_connections]]:
+                pairs.add(min(i, int(j)) * n + max(i, int(j)))
+        codes = np.array(sorted(pairs), dtype=np.int64)
+        left, right = codes // n, codes % n
+        weights = matrix[positions[left], positions[right]]
+        if matrix_key == 'tom_dissim':
+            weights = 1.0 - weights
+        gene_edges = pd.DataFrame({
+            'source': names[left],
+            'target': names[right],
+            'interaction': 'topological_overlap',
+            'TOM': weights,
+            'condition': condition,
+        })
+    else:
+        # Extract the upper triangle without copying the full TOM submatrix.
+        gene_edge_parts = []
+        for i, position in enumerate(positions[:-1]):
+            weights = matrix[position, positions[i + 1:]]
+            if matrix_key == 'tom_dissim':
+                weights = 1.0 - weights
+            keep = np.isfinite(weights) & (weights > min_tom)
+            if edge_scope == 'intramodular':
+                keep &= module_names[i + 1:] == module_names[i]
+            if not keep.any():
+                continue
+            gene_edge_parts.append(pd.DataFrame({
+                'source': names[i],
+                'target': names[i + 1:][keep],
+                'interaction': 'topological_overlap',
+                'TOM': weights[keep],
+                'condition': condition,
+            }))
+        gene_edges = (
+            pd.concat(gene_edge_parts, ignore_index=True)
+            if gene_edge_parts else pd.DataFrame({
+                'source': pd.Series(dtype=str),
+                'target': pd.Series(dtype=str),
+                'interaction': pd.Series(dtype=str),
+                'TOM': pd.Series(dtype=float),
+                'condition': pd.Series(dtype=str),
+            })
+        )
+        del gene_edge_parts
+    gene_edges.to_csv(files['gene_edges'], sep='\t', index=False)
+    n_gene_edges = len(gene_edges)
+    n_connected = len(set(gene_edges['source']).union(gene_edges['target']))
+
+    membership = None
+    n_membership_edges = 0
+    if include_module_nodes:
+        files['membership_edges'] = output_dir / f'{stem}_membership_edges.tsv'
+        membership = pd.DataFrame({
+            'source': names,
+            'target': module_names,
+            'interaction': 'module_membership',
+            'kME': genes['kME'].to_numpy(),
+            'condition': condition,
+        })
+        membership.to_csv(files['membership_edges'], sep='\t', index=False)
+        n_membership_edges = len(membership)
+
+    summary = {
+        'condition': condition,
+        'n_genes': len(genes),
+        'n_modules': n_modules,
+        'n_gene_edges': n_gene_edges,
+        'n_connected_genes': n_connected,
+        'n_isolated_genes': len(genes) - n_connected,
+        'n_membership_edges': n_membership_edges,
+    }
+    wd.setdefault('sctools_params', {})['ExportWgcnaToCytoscape'] = {
+        'condition_col': condition_col,
+        'prefix': str(prefix),
+        'n_hubs': None if n_hubs is None else int(n_hubs),
+        'min_tom': float(min_tom),
+        'top_connections': None if top_connections is None else int(top_connections),
+        'edge_scope': edge_scope,
+        'include_module_nodes': bool(include_module_nodes),
+        'output_dir': str(output_dir),
+        'matrix_key': matrix_key,
+        **summary,
+    }
+    return {
+        **summary,
+        'nodes': nodes,
+        'gene_edges': gene_edges,
+        'membership_edges': membership,
+    }
+
+
+
+def EvaluateWgcnaCytoscapeFilters(
+    adata,
+    *,
+    condition_col='condition',
+    wgcna_name='hdWGCNA',
+    tom_cutoffs=(0.10, 0.20, 0.30, 0.35, 0.40),
+    kme_cutoffs=(0.30, 0.50, 0.70),
+    module_quantiles=(0.90, 0.95, 0.99),
+    hub_counts=(25, 50, 100),
+    top_connections=(5, 10),
+):
+    """Summarize full-module TOM and simulate visualization filters.
+
+    Uses stored TOM (or 1 - tom_dissim), modules_df and dat_expr_genes.
+    Does not modify adata, infer networks or export reduced networks.
+    All simulations concern intramodular, undirected, positive-TOM edges;
+    grey genes, self-loops and nonfinite weights are excluded. Between-module
+    edges require a separate evaluation before the final export decision.
+
+    Returns a dict of DataFrames:
+      tom_by_module: exact pairwise TOM percentiles and full-module summaries;
+      gene_metrics: own-module kME and mean/sum TOM to all other module genes;
+      filters_by_module: selection, connected/isolated genes and edge counts;
+      filters_by_condition: counts pooled across modules for each scenario.
+
+    Thresholds use TOM > cutoff and kME >= cutoff. Module percentile cutoffs
+    are estimated from all finite pairs in the original assigned module,
+    including zero weights. Ties can change the nominal retained fraction.
+    Top-N genes have finite kME, ranked within their assigned module. Top-K
+    edges are ranked only among the selected genes in that same module;
+    retain an edge if EITHER endpoint selects it. Final degree may exceed K.
+    Ties are broken by gene name. Rankings retain the ORIGINAL TOM weights.
+
+    Exact quantiles temporarily hold one module's upper-triangle values in
+    memory (8 bytes per pair). No full-network edge DataFrame is constructed.
+    Mean/sum TOM exclude self and nonfinite pairs and are not WGCNA kWithin
+    (which is defined from adjacency). Filter diagnostics are descriptive,
+    not significance or module-preservation tests.
+    """
+    import numpy as np
+    import pandas as pd
+
+    wd = adata.uns['hdWGCNA'][wgcna_name]
+    labels = adata.obs[condition_col]
+    if labels.isna().any() or labels.nunique() != 1:
+        raise ValueError('adata must contain one nonmissing condition.')
+    condition = str(labels.iloc[0])
+    for q in module_quantiles:
+        if not 0 <= q <= 1:
+            raise ValueError('module_quantiles must be between 0 and 1.')
+    for x in (*hub_counts, *top_connections):
+        if not isinstance(x, (int, np.integer)) or x < 1:
+            raise ValueError('hub_counts and top_connections must be positive integers.')
+    for x in tom_cutoffs:
+        if not np.isfinite(x) or not 0 <= x <= 1:
+            raise ValueError('tom_cutoffs must be between 0 and 1.')
+    for x in kme_cutoffs:
+        if not np.isfinite(x) or not -1 <= x <= 1:
+            raise ValueError('kme_cutoffs must be between -1 and 1.')
+
+    matrix_key = 'TOM' if 'TOM' in wd else 'tom_dissim'
+    matrix = np.asarray(wd[matrix_key])
+    gene_order = pd.Index(wd['dat_expr_genes'])
+    if matrix.shape != (len(gene_order), len(gene_order)):
+        raise ValueError('TOM dimensions do not match dat_expr_genes.')
+    table = wd['modules_df'].loc[wd['modules_df']['module'].ne('grey')].copy()
+    if table.empty:
+        raise ValueError('No assigned genes found.')
+    table = table.sort_values('gene_name', kind='stable')
+
+    def Weights(position, other_positions):
+        weights = matrix[position, other_positions]
+        return 1.0 - weights if matrix_key == 'tom_dissim' else weights
+
+    def Measure(positions, cutoff=0.0, top_k=None):
+        n = len(positions)
+        degree = np.zeros(n, dtype=np.int64)
+        n_edges, total_weight = 0, 0.0
+        lowest, highest = np.inf, -np.inf
+        if top_k is None:
+            for i, position in enumerate(positions[:-1]):
+                weights = Weights(position, positions[i + 1:])
+                keep = np.isfinite(weights) & (weights > cutoff)
+                degree[i] += int(keep.sum())
+                degree[i + 1:] += keep
+                retained = weights[keep]
+                if retained.size:
+                    n_edges += retained.size
+                    total_weight += float(retained.sum())
+                    lowest = min(lowest, float(retained.min()))
+                    highest = max(highest, float(retained.max()))
+        else:
+            pairs = set()
+            for i, position in enumerate(positions):
+                weights = Weights(position, positions)
+                valid = np.isfinite(weights) & (weights > cutoff)
+                valid[i] = False
+                candidates = np.flatnonzero(valid)
+                ranked = candidates[np.argsort(-weights[candidates], kind='stable')]
+                for j in ranked[:top_k]:
+                    pairs.add(min(i, int(j)) * n + max(i, int(j)))
+            if pairs:
+                codes = np.fromiter(pairs, dtype=np.int64)
+                left, right = codes // n, codes % n
+                degree = np.bincount(np.concatenate([left, right]), minlength=n)
+                weights = matrix[positions[left], positions[right]]
+                if matrix_key == 'tom_dissim':
+                    weights = 1.0 - weights
+                n_edges = len(codes)
+                total_weight = float(weights.sum())
+                lowest, highest = float(weights.min()), float(weights.max())
+        return {
+            'n_selected': n,
+            'n_connected': int((degree > 0).sum()),
+            'n_isolated_selected': int((degree == 0).sum()),
+            'n_edges': int(n_edges),
+            'min_retained_TOM': lowest if n_edges else np.nan,
+            'mean_retained_TOM': total_weight / n_edges if n_edges else np.nan,
+            'max_retained_TOM': highest if n_edges else np.nan,
+        }
+
+    quantile_rows, gene_tables, filter_rows = [], [], []
+    fixed_probs = (0.50, 0.90, 0.95, 0.99)
+    probabilities = sorted(set(fixed_probs).union(module_quantiles))
+    for module, genes in table.groupby('module', observed=True, sort=False):
+        names = genes['gene_name'].to_numpy()
+        positions = gene_order.get_indexer(names)
+        if (positions < 0).any():
+            raise ValueError(f'{module}: a gene is absent from dat_expr_genes.')
+        kme = genes[f'kME_{module}'].to_numpy(dtype=float)
+        n = len(genes)
+        n_pairs = n * (n - 1) // 2
+        values = np.empty(n_pairs, dtype=np.float64)
+        weight_sum = np.zeros(n, dtype=float)
+        finite_count = np.zeros(n, dtype=np.int64)
+        offset = 0
+        for i, position in enumerate(positions[:-1]):
+            weights = Weights(position, positions[i + 1:])
+            values[offset:offset + len(weights)] = weights
+            offset += len(weights)
+            valid = np.isfinite(weights)
+            safe_weights = np.where(valid, weights, 0)
+            weight_sum[i] += safe_weights.sum()
+            weight_sum[i + 1:] += safe_weights
+            finite_count[i] += valid.sum()
+            finite_count[i + 1:] += valid
+        if not np.isfinite(values).all():
+            values = values[np.isfinite(values)]
+        n_finite_pairs = len(values)
+        n_positive_pairs = int((values > 0).sum())
+        quantiles = dict(zip(
+            probabilities,
+            np.quantile(values, probabilities, overwrite_input=True)
+            if n_finite_pairs else [np.nan] * len(probabilities),
+        ))
+        del values
+        mean_tom = np.divide(
+            weight_sum, finite_count, out=np.full(n, np.nan), where=finite_count > 0
+        )
+        valid = np.isfinite(kme) & np.isfinite(mean_tom)
+        rho = np.nan
+        if valid.sum() > 1 and np.unique(kme[valid]).size > 1 and np.unique(mean_tom[valid]).size > 1:
+            rho = pd.Series(kme[valid]).corr(pd.Series(mean_tom[valid]), method='spearman')
+        quantile_rows.append({
+            'condition': condition, 'module': module, 'n_genes': n,
+            'n_pairs': n_pairs, 'n_finite_pairs': n_finite_pairs,
+            'n_positive_pairs': n_positive_pairs,
+            **{f'TOM_P{round(100 * q)}': quantiles[q] for q in fixed_probs},
+            'rho_kME_mean_TOM': rho,
+            'n_negative_kME': int((kme < 0).sum()),
+            'matrix_key': matrix_key,
+        })
+        gene_tables.append(pd.DataFrame({
+            'condition': condition, 'module': module, 'gene_name': names,
+            'kME': kme, 'full_module_mean_TOM': mean_tom,
+            'full_module_sum_TOM': weight_sum, 'n_finite_module_partners': finite_count,
+        }))
+
+        all_indices = np.arange(n)
+        scenarios = [('all_assigned', all_indices, 0.0, None)]
+        scenarios += [(f'TOM>{t:g}', all_indices, t, None) for t in tom_cutoffs]
+        scenarios += [(f'kME>={t:g}', np.flatnonzero(kme >= t), 0.0, None) for t in kme_cutoffs]
+        scenarios += [(f'module_P{100*q:g}', all_indices, quantiles[q], None) for q in module_quantiles]
+        eligible = np.flatnonzero(np.isfinite(kme))
+        ranked = eligible[np.argsort(-kme[eligible], kind='stable')]
+        for top_n in hub_counts:
+            chosen = np.sort(ranked[:top_n])
+            scenarios.append((f'top{top_n}_kME', chosen, 0.0, None))
+            for top_k in top_connections:
+                scenarios.append((f'top{top_n}_kME_top{top_k}_TOM', chosen, 0.0, top_k))
+        for scenario, chosen, cutoff, top_k in scenarios:
+            metrics = Measure(positions[chosen], cutoff, top_k)
+            selected_pairs = len(chosen) * (len(chosen) - 1) // 2
+            filter_rows.append({
+                'condition': condition, 'module': module, 'scenario': scenario,
+                'edge_scope': 'intramodular', 'n_genes_full': n,
+                'n_pairs_full': n_pairs, 'TOM_cutoff': cutoff,
+                'top_connections': top_k, **metrics,
+                'pct_genes_selected': 100 * len(chosen) / n,
+                'pct_genes_connected_full': 100 * metrics['n_connected'] / n,
+                'pct_edges_of_full_pairs': 100 * metrics['n_edges'] / n_pairs if n_pairs else np.nan,
+                'selected_pair_density': metrics['n_edges'] / selected_pairs if selected_pairs else np.nan,
+            })
+
+    per_module = pd.DataFrame(filter_rows)
+    totals = (
+        per_module.groupby(['condition', 'scenario', 'edge_scope'], sort=False)[
+            ['n_genes_full', 'n_pairs_full', 'n_selected', 'n_connected',
+             'n_isolated_selected', 'n_edges']
+        ].sum().reset_index()
+    )
+    totals['pct_genes_selected'] = 100 * totals['n_selected'] / totals['n_genes_full']
+    totals['pct_genes_connected_full'] = 100 * totals['n_connected'] / totals['n_genes_full']
+    totals['pct_edges_of_full_pairs'] = 100 * totals['n_edges'] / totals['n_pairs_full']
+    return {
+        'tom_by_module': pd.DataFrame(quantile_rows),
+        'gene_metrics': pd.concat(gene_tables, ignore_index=True),
+        'filters_by_module': per_module,
+        'filters_by_condition': totals,
+    }
+
+
+# -------------- MODULE PRESERVATION
+
+### Original R/WGCNA module preservation from existing py_hdWGCNA results.
+
+
+def PrepareWgcnaPreservationInputs(
+    adata_ref,
+    adata_contrast,
+    ref_name='reference',
+    contrast_name='contrast',
+    wgcna_name='hdWGCNA',
+):
+    """Align saved reference/test metacell expression without modifying AnnData.
+
+    Reads dat_expr (genes x metacells), dat_expr_genes, dat_expr_cells and
+    modules_df from uns['hdWGCNA'][wgcna_name] in both objects.
+    ref_name and contrast_name must be distinct dataset labels.
+
+    Returns expression (dataset -> metacells x shared genes DataFrame),
+    labels (shared genes x datasets), coverage (original/shared module sizes)
+    and common_genes (list in reference order). Includes grey in the universe.
+    """
+    import numpy as np
+    import pandas as pd
+    from scipy import sparse
+
+    # Keep explicit dataset names so the output records which object was used.
+    if any(not isinstance(c, str) or not c for c in (ref_name, contrast_name)):
+        raise ValueError('Dataset names must be nonempty strings.')
+    if ref_name == contrast_name:
+        raise ValueError('ref_name and contrast_name must differ.')
+    networks = {ref_name: adata_ref, contrast_name: adata_contrast}
+
+    # Read the existing network matrices; do not repeat cell or gene selection.
+    data = {c: obj.uns['hdWGCNA'][wgcna_name] for c, obj in networks.items()}
+    gene_lists = {c: pd.Index(wd['dat_expr_genes']) for c, wd in data.items()}
+    for condition, genes in gene_lists.items():
+        if not genes.is_unique or genes.hasnans:
+            raise ValueError(f'{condition}: network gene names must be unique and nonmissing.')
+
+    # Match final network genes, including grey, in the reference gene order.
+    # This matching affects this comparison only, not the original networks.
+    common_genes = gene_lists[ref_name].intersection(
+        gene_lists[contrast_name], sort=False,
+    ).tolist()
+    if len(common_genes) < 4:
+        raise ValueError('At least four shared network genes are required.')
+
+    expression, labels, coverage = {}, {}, []
+    for condition, wd in data.items():
+        # Locate the shared genes in this object's original matrix order.
+        genes = gene_lists[condition]
+        cells = pd.Index(wd['dat_expr_cells'], name='metacell')
+        values = wd['dat_expr']
+        if values.shape != (len(genes), len(cells)):
+            raise ValueError(f'{condition}: dat_expr dimensions do not match its labels.')
+        positions = genes.get_indexer(common_genes)
+        selected = values[positions, :] if sparse.issparse(values) else np.asarray(values)[positions, :]
+        selected = selected.toarray() if sparse.issparse(selected) else selected
+        # Reject nonfinite values; WGCNA also checks expression quality below.
+        # Do not silently remove problematic genes or metacells.
+        if len(cells) < 4 or not np.isfinite(selected).all():
+            raise ValueError(f'{condition}: need >=4 metacells and finite expression values.')
+
+        # R/WGCNA expects metacells in rows and genes in columns: transpose once.
+        expression[condition] = pd.DataFrame(
+            selected.T, index=cells, columns=pd.Index(common_genes, name='gene_name'),
+        )
+
+        # Align module labels to expression columns, not modules_df row order.
+        assignments = wd['modules_df'].set_index('gene_name')['module']
+        if not assignments.index.is_unique:
+            raise ValueError(f'{condition}: modules_df must contain one row per gene.')
+        assignments = assignments.loc[genes]
+        if assignments.isna().any():
+            raise ValueError(f'{condition}: missing module labels.')
+        assignments = assignments.astype(str)
+        if assignments.eq('gold').any():
+            raise ValueError("'gold' is reserved for the WGCNA random control.")
+        labels[condition] = assignments.loc[common_genes]
+
+        # Record coverage, including modules with no genes left after matching.
+        before, after = assignments.value_counts(), labels[condition].value_counts()
+        for module, n_original in before.items():
+            n_shared = int(after.get(module, 0))
+            coverage.append({
+                'condition': condition, 'module': module,
+                'n_genes_original': int(n_original), 'n_genes_shared': n_shared,
+                'pct_genes_shared': 100 * n_shared / n_original,
+                'n_metacells': len(cells),
+            })
+    # Return data frames for reuse; neither AnnData object is modified.
+    return {
+        'expression': expression,
+        'labels': pd.DataFrame(labels).rename_axis('gene_name'),
+        'coverage': pd.DataFrame(coverage),
+        'common_genes': common_genes,
+    }
+
+
+def RunWgcnaModulePreservation(
+    adata_ref,
+    adata_contrast,
+    ref_name='reference',
+    contrast_name='contrast',
+    wgcna_name='hdWGCNA',
+    bidirectional=True,
+    n_permutations=250,
+    network_type='signed',
+    cor_method='pearson',
+    seed=42,
+    max_module_size=None,
+    max_gold_module_size=1000,
+    output_dir=None,
+    verbose=True,
+):
+    """Call original R/WGCNA preservation through rpy2 + pandas2ri.
+
+    adata_ref, adata_contrast : AnnData with saved hdWGCNA results.
+    ref_name, contrast_name : distinct dataset names used in output tables.
+    wgcna_name : analysis name shared by both objects.
+    bidirectional : True tests both directions; False only reference -> contrast.
+    n_permutations : permutation count (250 by default; >=100 recommended).
+    network_type, cor_method : settings matching the original networks.
+        Methods: pearson, spearman or bicor (R's individual Pearson fallback).
+    seed : nonnegative R random seed.
+    max_module_size : None retains all shared module genes; an integer permits
+        WGCNA to subsample larger modules. max_gold_module_size caps its benchmark.
+    output_dir : optional empty folder for tables, shared genes, parameters,
+        versions and complete native RDS. None writes no files.
+    verbose : show native WGCNA progress in the notebook.
+
+    Returns summary, observed, Z, log_p, log_p_bonferroni, quality_observed,
+    quality_Z and coverage DataFrames, plus common_genes, parameters and versions.
+    Summary retains zero-coverage modules with missing statistics, excluding grey.
+    Uses saved metacell expression; no original TOM, kME or hME input is needed.
+    Does not modify AnnData or global conversion settings. Requires existing
+    R/WGCNA and rpy2; no installation or transfer files.
+    """
+    import json
+    import platform
+    import warnings
+    from importlib import metadata
+    from numbers import Integral
+    from pathlib import Path
+
+    import pandas as pd
+
+    # Reject settings that would silently change the requested analysis.
+    if not isinstance(bidirectional, bool):
+        raise ValueError('bidirectional must be True or False.')
+    if not isinstance(n_permutations, Integral) or n_permutations < 2:
+        raise ValueError('n_permutations must be an integer >=2.')
+    if n_permutations < 100:
+        warnings.warn('Fewer than 100 permutations: use only for a smoke test.', stacklevel=2)
+    if network_type not in {'signed', 'unsigned', 'signed hybrid'}:
+        raise ValueError('Unsupported network_type.')
+    if cor_method not in {'pearson', 'spearman', 'bicor'}:
+        raise ValueError('Unsupported cor_method.')
+    if not isinstance(seed, Integral) or not 0 <= seed <= 2147483647:
+        raise ValueError('seed must be an integer between 0 and 2147483647.')
+    for name, value in [('max_module_size', max_module_size),
+                        ('max_gold_module_size', max_gold_module_size)]:
+        if value is not None and (not isinstance(value, Integral) or value < 4):
+            raise ValueError(f'{name} must be an integer >=4.')
+    if max_gold_module_size is None:
+        raise ValueError('max_gold_module_size cannot be None.')
+
+    # Read existing matrices and align genes; do not reconstruct either network.
+    prepared = PrepareWgcnaPreservationInputs(
+        adata_ref, adata_contrast, ref_name, contrast_name, wgcna_name,
+    )
+    names = [ref_name, contrast_name]
+    labels, coverage = prepared['labels'], prepared['coverage']
+    for name, obj in zip(names, (adata_ref, adata_contrast)):
+        wd = obj.uns['hdWGCNA'][wgcna_name]
+        for key, value in [('network_type', network_type), ('cor_method', cor_method)]:
+            if key in wd and wd[key] != value:
+                raise ValueError(f'{name}: {key} differs from the saved network setting.')
+
+    # A cap equal to the shared universe prevents any module subsampling.
+    cap = len(prepared['common_genes']) if max_module_size is None else int(max_module_size)
+    if (coverage.loc[coverage['module'].ne('grey'), 'n_genes_shared'] > cap).any():
+        warnings.warn('Large modules will be randomly subsampled to max_module_size.', stacklevel=2)
+    directions = [(0, 1), (1, 0)] if bidirectional else [(0, 1)]
+    cor_options = {
+        'pearson': "use = 'p', method = 'pearson'",
+        'spearman': "use = 'p', method = 'spearman'",
+        'bicor': "use = 'p', pearsonFallback = 'individual'",
+    }
+
+    # Protect previous exports before starting the potentially expensive R test.
+    folder = Path(output_dir).expanduser() if output_dir is not None else None
+    if folder is not None:
+        if folder.exists() and any(folder.iterdir()):
+            raise FileExistsError('output_dir must be empty; use a new folder for this run.')
+        folder.mkdir(parents=True, exist_ok=True)
+
+    # Only DataFrames cross the bridge; use rpy2's built-in pandas converter.
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+    from rpy2.robjects.packages import importr
+
+    converter = ro.default_converter + pandas2ri.converter
+    with localconverter(ro.default_converter):
+        wgcna = importr('WGCNA')
+        expression_r = {}
+        for name, frame in prepared['expression'].items():
+            # Transfer only the required matrix, preserving metacell/gene names.
+            with localconverter(converter):
+                frame_r = ro.conversion.get_conversion().py2rpy(frame)
+            expression_r[name] = ro.ListVector({'data': frame_r})
+        labels_r = ro.ListVector({name: ro.StrVector(labels[name].tolist()) for name in names})
+
+        # Call the installed function directly. WGCNA checks expression quality;
+        # no custom R function, file transfer or statistical reimplementation.
+        native = wgcna.modulePreservation(
+            multiData=ro.ListVector(expression_r), multiColor=labels_r,
+            dataIsExpr=True, networkType=network_type,
+            corFnc='bicor' if cor_method == 'bicor' else 'cor',
+            corOptions=cor_options[cor_method],
+            referenceNetworks=ro.IntVector([ref + 1 for ref, test in directions]),
+            nPermutations=int(n_permutations), randomSeed=int(seed),
+            maxModuleSize=cap, maxGoldModuleSize=int(max_gold_module_size),
+            greyName='grey', goldName='gold', checkData=True,
+            parallelCalculation=False, savePermutedStatistics=False,
+            loadPermutedStatistics=False, verbose=3 if verbose else 0,
+        )
+
+        # Native tables are nested by reference position, then test dataset index.
+        # Convert only those tables; the full permutation result stays in R.
+        tables = {
+            'observed': ('preservation', 'observed'),
+            'Z': ('preservation', 'Z'),
+            'log_p': ('preservation', 'log.p'),
+            'log_p_bonferroni': ('preservation', 'log.pBonf'),
+            'quality_observed': ('quality', 'observed'),
+            'quality_Z': ('quality', 'Z'),
+        }
+        results = {}
+        for key, (component, statistic) in tables.items():
+            frames = []
+            for i, (ref, test) in enumerate(directions):
+                table_r = native.rx2(component).rx2(statistic)[i][test]
+                if table_r is ro.NULL:
+                    continue
+                with localconverter(converter):
+                    frame = ro.conversion.get_conversion().rpy2py(table_r)
+                frame.insert(0, 'module', frame.index.astype(str))
+                frame.insert(0, 'test', names[test])
+                frame.insert(0, 'reference', names[ref])
+                frames.append(frame.reset_index(drop=True))
+            if not frames:
+                raise ValueError(f'WGCNA returned no {component}/{statistic} tables.')
+            results[key] = pd.concat(frames, ignore_index=True)
+
+        # Keep R software versions and, optionally, the complete native result.
+        versions = {
+            'R': str(ro.r('R.version.string')[0]),
+            'WGCNA': str(ro.r('as.character(utils::packageVersion("WGCNA"))')[0]),
+            'Python': platform.python_version(),
+        }
+        if folder is not None:
+            ro.r['saveRDS'](native, file=str(folder / 'WGCNA_modulePreservation.rds'))
+
+    # Add ranks and coverage to the main Z statistics, retaining untestable modules.
+    keys = ['reference', 'test', 'module']
+    z_columns = ['moduleSize', 'Zsummary.pres', 'Zdensity.pres', 'Zconnectivity.pres']
+    rank_columns = ['medianRank.pres', 'medianRankDensity.pres', 'medianRankConnectivity.pres']
+    stats = results['Z'].reindex(columns=keys + z_columns).rename(
+        columns={'moduleSize': 'n_genes_tested'},
+    ).merge(results['observed'].reindex(columns=keys + rank_columns), on=keys, how='outer')
+    pairs = pd.DataFrame([
+        {'reference': names[ref], 'test': names[test]} for ref, test in directions
+    ])
+    results['summary'] = pairs.merge(
+        coverage.loc[coverage['module'].ne('grey')].rename(columns={'condition': 'reference'}),
+        on='reference', how='left',
+    ).merge(stats, on=keys, how='left')
+
+    # Record settings once; raw log-p tables are not p-values for Zsummary.
+    parameters = {
+        'wgcna_name': wgcna_name, 'reference': ref_name, 'contrast': contrast_name,
+        'bidirectional': bidirectional, 'n_permutations': int(n_permutations),
+        'network_type': network_type, 'cor_method': cor_method, 'seed': int(seed),
+        'max_module_size_requested': None if max_module_size is None else int(max_module_size),
+        'max_module_size_used': cap, 'max_gold_module_size': int(max_gold_module_size),
+        'n_common_genes': len(prepared['common_genes']),
+        'expression_source': 'saved dat_expr (metacells)',
+        'integration': 'rpy2 + pandas2ri', 'parallel_calculation': False,
+    }
+    for package in ['rpy2', 'numpy', 'pandas']:
+        try:
+            versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            versions[package] = 'unknown'
+    results.update({
+        'coverage': coverage, 'common_genes': prepared['common_genes'],
+        'parameters': parameters, 'versions': versions,
+    })
+
+    # Export each table once. Everything remains accessible as Python objects.
+    if folder is not None:
+        for key, table in results.items():
+            if isinstance(table, pd.DataFrame):
+                table.to_csv(folder / f'{key}.csv', index=False)
+        pd.Series(results['common_genes'], name='gene_name').to_csv(
+            folder / 'common_genes.csv', index=False,
+        )
+        for key in ['parameters', 'versions']:
+            (folder / f'{key}.json').write_text(json.dumps(results[key], indent=2), encoding='utf-8')
+    return results
+
+
+#----------------------------
+def PrepareWgcnaHubExpression(
+    adata_ref,
+    adata_contrast=None,
+    modules_ref=None,
+    modules_contrast=None,
+    ref_name='WT',
+    contrast_name='KO',
+    n_hubs=10,
+    layer='QC_filtered_log1p',
+    group_by='celltype',
+    sample_col='sample',
+    group_order=None,
+    wgcna_name='hdWGCNA',
+):
+    """Select own-module hubs and prepare jointly scaled gene-by-cell expression.
+
+    With a contrast, use the union of both hub lists without duplicated genes.
+    Return expression, scaled_expression, gene_metadata, cell_metadata,
+    group_order and conditions. Inputs are not modified.
+    """
+    import numpy as np
+    import pandas as pd
+    from scipy import sparse
+
+    if not isinstance(n_hubs, (int, np.integer)) or n_hubs < 1:
+        raise ValueError('n_hubs must be a positive integer.')
+    if adata_contrast is not None and ref_name == contrast_name:
+        raise ValueError('Reference and contrast names must differ.')
+
+    # Each condition can contribute hubs from all modules or a requested subset.
+    datasets = [(ref_name, adata_ref, modules_ref)]
+    if adata_contrast is not None:
+        datasets.append((contrast_name, adata_contrast, modules_contrast))
+    conditions = [name for name, _, _ in datasets]
+    tables, selections, genes = {}, {}, []
+
+    for name, obj, requested in datasets:
+        table = obj.uns['hdWGCNA'][wgcna_name]['modules_df'].copy()
+        table = table.set_index('gene_name', verify_integrity=True)
+        available = sorted(table.loc[table['module'].ne('grey'), 'module'].unique())
+        selected_modules = (
+            available if requested is None
+            else [requested] if isinstance(requested, str) else list(requested)
+        )
+        if not selected_modules or not set(selected_modules).issubset(available):
+            raise ValueError(f'{name}: select existing, non-grey modules: {available}.')
+
+        # Rank each gene by kME for its own module, using the saved results.
+        selected = []
+        for module in selected_modules:
+            ranked = table.loc[table['module'].eq(module), f'kME_{module}']
+            ranked = ranked.dropna().sort_values(ascending=False, kind='stable')
+            if ranked.empty:
+                raise ValueError(f'{name} {module}: no available kME values.')
+            selected.extend(ranked.head(n_hubs).index)
+        tables[name], selections[name] = table, set(selected)
+
+        # Reference hubs come first; contrast contributes only additional genes.
+        # A shared hub appears once in the heatmap.
+        for gene in selected:
+            if gene not in genes:
+                genes.append(gene)
+
+    # Use one stage order and the same gene order in all conditions.
+    observed_groups = list(dict.fromkeys(
+        str(group) for _, obj, _ in datasets
+        for group in obj.obs[group_by].dropna().unique()
+    ))
+    stage_order = list(dict.fromkeys(str(group) for group in (
+        observed_groups if group_order is None else group_order
+    )))
+    # Unlisted stages are appended rather than silently removing cells.
+    stage_order += [group for group in observed_groups if group not in stage_order]
+    gene_metadata = pd.DataFrame(index=pd.Index(genes, name='gene_name'))
+    expressions, metadata = {}, {}
+
+    for name, obj, _ in datasets:
+        if not obj.var_names.is_unique or not obj.obs_names.is_unique:
+            raise ValueError(f'{name}: gene and cell identifiers must be unique.')
+        missing = pd.Index(genes).difference(obj.var_names)
+        if len(missing):
+            raise ValueError(f'{name}: selected genes absent from var_names: {list(missing)}.')
+        if obj.obs[group_by].isna().any():
+            raise ValueError(f'{name}: {group_by} contains missing labels.')
+
+        # Sort cells by annotated stage and then sample; do not cluster cells.
+        obs_columns = [group_by] + ([sample_col] if sample_col is not None
+                                   and sample_col != group_by else [])
+        obs = obj.obs[obs_columns].copy()
+        obs[group_by] = pd.Categorical(
+            obs[group_by].astype(str), categories=stage_order, ordered=True,
+        )
+        obs = obs.sort_values(obs_columns, kind='stable')
+
+        # Densify only the selected genes, not the complete expression matrix.
+        values = obj[obs.index, genes].layers[layer]
+        values = values.toarray() if sparse.issparse(values) else np.asarray(values)
+        values = values.astype(np.float32, copy=False)
+        if not np.isfinite(values).all():
+            raise ValueError(f'{name}: selected expression contains nonfinite values.')
+        expressions[name] = pd.DataFrame(values.T, index=genes, columns=obs.index)
+        obs['condition'] = name
+        metadata[name] = obs
+
+        # Preserve original membership, even when a selected gene is grey elsewhere.
+        table = tables[name].reindex(genes)
+        gene_metadata[f'module_{name}'] = table['module'].astype(object).fillna('not_in_network')
+        gene_metadata[f'hub_{name}'] = gene_metadata.index.isin(selections[name])
+        gene_metadata[f'color_{name}'] = (
+            table['color'].astype(object).fillna('#eeeeee')
+            if 'color' in table else '#808080'
+        )
+
+    # Condition/cell MultiIndexes distinguish identical barcodes across datasets.
+    expression = pd.concat(expressions, axis=1, names=['condition', 'cell'])
+    cell_metadata = pd.concat(metadata, names=['condition_key', 'cell'])
+
+    # In a two-condition plot, calculate each gene's mean and SD jointly.
+    # Separate condition-wise scaling would remove between-condition mean shifts.
+    values = expression.to_numpy()
+    centered = values - values.mean(axis=1, keepdims=True)
+    deviation = values.std(axis=1, keepdims=True, ddof=0)
+    scaled = np.divide(centered, deviation, out=np.zeros_like(centered), where=deviation > 0)
+    gene_metadata['constant_expression'] = deviation[:, 0] == 0
+    scaled = pd.DataFrame(scaled, index=expression.index, columns=expression.columns)
+    return {
+        'expression': expression,
+        'scaled_expression': scaled,
+        'gene_metadata': gene_metadata,
+        'cell_metadata': cell_metadata,
+        'group_by': group_by,
+        'group_order': stage_order,
+        'conditions': conditions,
+    }
+
+
+def PlotWgcnaHubExpression(prepared, vlim=2, figsize=None, show_gene_names=True):
+    """Plot prepared hub expression with stage and module annotation strips.
+
+    Return a Matplotlib Figure. Cells and genes keep their prepared order.
+    Colors saturate at +/-vlim; returned expression values remain unchanged.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap, to_rgba
+
+    if vlim <= 0:
+        raise ValueError('vlim must be positive.')
+    data = prepared['scaled_expression']
+    genes = prepared['gene_metadata'].loc[data.index]
+    obs = prepared['cell_metadata'].reindex(data.columns)
+    conditions, group_by = prepared['conditions'], prepared['group_by']
+    if data.empty:
+        raise ValueError('No genes or cells to plot.')
+    n_genes, n_cells = data.shape
+
+    # imshow creates a raster heatmap, keeping large cell-level PDFs manageable.
+    fig = plt.figure(figsize=figsize or (11, max(4.5, 0.20 * n_genes + 2)))
+    grid = fig.add_gridspec(
+        4, 1 + len(conditions),
+        height_ratios=[0.28, 0.40, max(2.5, 0.18 * n_genes), 0.16],
+        width_ratios=[30] + [4] * len(conditions),
+        hspace=0.10, wspace=0.05,
+    )
+
+    # Identify contiguous runs for readable group labels and divider lines.
+    def _Runs(labels):
+        labels = np.asarray(labels, dtype=object)
+        starts = np.r_[0, np.flatnonzero(labels[1:] != labels[:-1]) + 1]
+        stops = np.r_[starts[1:], len(labels)]
+        return [(start, stop, labels[start]) for start, stop in zip(starts, stops)]
+
+    # Top strips show condition and stage; stages use the same colors everywhere.
+    stages = prepared['group_order']
+    stage_palette = dict(zip(stages, plt.get_cmap('Set3')(np.linspace(0, 1, len(stages)))))
+    condition_palette = dict(zip(conditions, plt.get_cmap('Set2')(
+        np.linspace(0, 1, len(conditions)))))
+    for row, labels, palette in [
+        (0, obs['condition'].astype(str).to_numpy(), condition_palette),
+        (1, obs[group_by].astype(str).to_numpy(), stage_palette),
+    ]:
+        ax = fig.add_subplot(grid[row, 0])
+        rgba = np.array([to_rgba(palette[label]) for label in labels])
+        ax.imshow(rgba[None, :, :], aspect='auto', interpolation='nearest')
+        for start, stop, label in _Runs(labels):
+            ax.text((start + stop - 1) / 2, 0, str(label), ha='center', va='center', fontsize=8)
+        ax.set_axis_off()
+
+    # Magenta -> black -> yellow reproduces the supplied reference's color scheme.
+    cmap = LinearSegmentedColormap.from_list('hub_expression', ['#cc00cc', '#000000', '#ffff00'])
+    ax = fig.add_subplot(grid[2, 0])
+    image = ax.imshow(data.to_numpy(), cmap=cmap, vmin=-vlim, vmax=vlim,
+                      aspect='auto', interpolation='nearest')
+    ax.set_xticks([])
+    ax.set_yticks(np.arange(n_genes) if show_gene_names else [])
+    if show_gene_names:
+        ax.set_yticklabels(data.index, fontsize=7, fontstyle='italic')
+    ax.tick_params(axis='y', length=0)
+
+    # Draw condition boundaries using the identical cell coordinates as the heatmap.
+    for start, _, _ in _Runs(obs['condition'].astype(str)):
+        if start:
+            ax.axvline(start - 0.5, color='white', linewidth=1.2)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    # Right strips retain module assignments in each original network.
+    # The same gene is shown once, with a separate membership strip per condition.
+    for col, name in enumerate(conditions, start=1):
+        strip = fig.add_subplot(grid[2, col])
+        colors = np.array([to_rgba(color) for color in genes[f'color_{name}']])
+        strip.imshow(colors[:, None, :], aspect='auto', interpolation='nearest')
+        # Reserve room for labels inside each strip's own subplot.
+        strip.set_xlim(-0.5, 4)
+        for start, stop, module in _Runs(genes[f'module_{name}'].astype(str)):
+            strip.text(1.15, (start + stop - 1) / 2, str(module),
+                       ha='left', va='center', fontsize=7, clip_on=False)
+        strip.set_title(name, fontsize=9)
+        strip.set_axis_off()
+
+    # Color limits only control display saturation, not gene selection or testing.
+    colorbar_ax = fig.add_subplot(grid[3, 0])
+    fig.colorbar(image, cax=colorbar_ax, orientation='horizontal',
+                 label='Expression z-score per gene', ticks=[-vlim, 0, vlim])
+    fig.suptitle('Module hub gene expression', y=0.99, fontsize=13)
+    fig.subplots_adjust(left=0.16, right=0.89, top=0.91, bottom=0.13)
+    return fig

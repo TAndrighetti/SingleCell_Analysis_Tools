@@ -5,7 +5,9 @@ sctools/alra.py
 sctools/annotation.py
 sctools/degs.py
 sctools/functionalanalysis.py
+sctools/hdwgcna.py
 sctools/io.py
+sctools/mast.py
 sctools/networks.py
 sctools/non_used_functions.py
 sctools/plots.py
