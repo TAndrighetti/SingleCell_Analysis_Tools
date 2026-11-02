@@ -115,6 +115,7 @@ __all__ = [
     "CalculateGeneCellCorrelations",
     "SelectTopCorrelatedGenes",
     "LoadHallmarkCategories",
+    "LoadMSigDBCollection",
 ]
 
 
@@ -130,6 +131,132 @@ def LoadHallmarkCategories(
     """
     with open(path) as f:
         return json.load(f)
+
+
+# GMT file suffix of each organism in the MSigDB release
+_MSIGDB_SUFFIX = {"mouse": "Mm", "human": "Hs"}
+
+# MSigDB collections: {name: (content, {organism: GMT file stem})}.
+# An organism is missing when MSigDB has no native collection for it.
+_MSIGDB_COLLECTIONS = {
+    "hallmark": ("hallmark", {"mouse": "mh.all", "human": "h.all"}),
+    "go.bp": ("GO biological process", {"mouse": "m5.go.bp", "human": "c5.go.bp"}),
+    "go.cc": ("GO cellular component", {"mouse": "m5.go.cc", "human": "c5.go.cc"}),
+    "go.mf": ("GO molecular function", {"mouse": "m5.go.mf", "human": "c5.go.mf"}),
+    "reactome": ("Reactome pathways", {"mouse": "m2.cp.reactome", "human": "c2.cp.reactome"}),
+    "wikipathways": ("WikiPathways", {"mouse": "m2.cp.wikipathways", "human": "c2.cp.wikipathways"}),
+    "biocarta": ("BioCarta pathways", {"mouse": "m2.cp.biocarta", "human": "c2.cp.biocarta"}),
+    "kegg": ("KEGG pathways (legacy)", {"human": "c2.cp.kegg_legacy"}),
+    "kegg.medicus": ("KEGG MEDICUS pathways", {"human": "c2.cp.kegg_medicus"}),
+    "pid": ("PID pathways", {"human": "c2.cp.pid"}),
+    "cgp": ("chemical and genetic perturbations", {"mouse": "m2.cgp", "human": "c2.cgp"}),
+    "tf.gtrd": ("TF targets (GTRD)", {"mouse": "m3.gtrd", "human": "c3.tft.gtrd"}),
+    "tf.legacy": ("TF targets (legacy)", {"human": "c3.tft.tft_legacy"}),
+    "mir.mirdb": ("miRNA targets (miRDB)", {"mouse": "m3.mirdb", "human": "c3.mir.mirdb"}),
+    "mir.legacy": ("miRNA targets (legacy)", {"human": "c3.mir.mir_legacy"}),
+    "celltype": ("cell type signatures", {"mouse": "m8.all", "human": "c8.all"}),
+    "positional": ("positional", {"mouse": "m1.all", "human": "c1.all"}),
+    "mpt": ("mammalian phenotype ontology", {"mouse": "m5.mpt"}),
+    "hpo": ("human phenotype ontology", {"human": "c5.hpo"}),
+    "immunesigdb": ("ImmuneSigDB", {"human": "c7.immunesigdb"}),
+    "vaccine": ("vaccine response", {"human": "c7.vax"}),
+    "oncogenic": ("oncogenic signatures", {"human": "c6.all"}),
+    "cancer.3ca": ("cancer cell atlas", {"human": "c4.3ca"}),
+    "cancer.cgn": ("cancer gene neighborhoods", {"human": "c4.cgn"}),
+    "cancer.cm": ("cancer modules", {"human": "c4.cm"}),
+}
+
+
+def LoadMSigDBCollection(
+    collection: str = "go.bp",
+    *,
+    organism: str = "mouse",
+    gmt_dir: str | Path = "/home/tahila/0.resources",
+    msigdb_version: str = "2025.1",
+) -> pd.DataFrame:
+    """
+    Load one native MSigDB collection (mouse or human) as a decoupler network.
+
+    Uses the native GMT files of each organism from MSigDB (Mm for mouse, Hs
+    for human). For mouse data, use the mouse collections, not human sets
+    translated by orthology (e.g. `dc.op.resource("MSigDB")`), so
+    mouse-specific genes such as `Defa*` are kept. The file is read from
+    `gmt_dir` and downloaded from MSigDB if missing. `msigdb_version` is
+    fixed, so the gene sets do not change between runs.
+
+    The collection prefix is removed from the set names (GOBP_, HALLMARK_,
+    REACTOME_, ...), the same names as `dc.op.hallmark` and the hallmark
+    category JSON. Sets without a common prefix (e.g. cgp) are not changed.
+
+    Collections (organisms with a native MSigDB collection):
+        hallmark      hallmark                             mouse, human
+        go.bp         GO biological process                mouse, human
+        go.cc         GO cellular component                mouse, human
+        go.mf         GO molecular function                mouse, human
+        reactome      Reactome pathways                    mouse, human
+        wikipathways  WikiPathways                         mouse, human
+        biocarta      BioCarta pathways                    mouse, human
+        kegg          KEGG pathways (legacy)               human
+        kegg.medicus  KEGG MEDICUS pathways                human
+        pid           PID pathways                         human
+        cgp           chemical and genetic perturbations   mouse, human
+        tf.gtrd       TF targets (GTRD)                    mouse, human
+        tf.legacy     TF targets (legacy)                  human
+        mir.mirdb     miRNA targets (miRDB)                mouse, human
+        mir.legacy    miRNA targets (legacy)               human
+        celltype      cell type signatures                 mouse, human
+        positional    positional                           mouse, human
+        mpt           mammalian phenotype ontology         mouse
+        hpo           human phenotype ontology             human
+        immunesigdb   ImmuneSigDB                          human
+        vaccine       vaccine response                     human
+        oncogenic     oncogenic signatures                 human
+        cancer.3ca    cancer cell atlas                    human
+        cancer.cgn    cancer gene neighborhoods            human
+        cancer.cm     cancer modules                       human
+
+    Parameters
+    ----------
+    collection : one of the collections above.
+    organism : "mouse" or "human".
+    gmt_dir : folder of the GMT files.
+    msigdb_version : MSigDB release of the GMT files.
+
+    Returns
+    -------
+    DataFrame with columns "source" (gene set) and "target" (gene), no duplicates.
+    """
+    if organism not in _MSIGDB_SUFFIX:
+        raise ValueError(f"organism='{organism}' not valid. Options: {list(_MSIGDB_SUFFIX)}.")
+
+    available = {k: v for k, (v, stems) in _MSIGDB_COLLECTIONS.items() if organism in stems}
+    if collection not in available:
+        options = "\n".join(f"  {k:14s}{v}" for k, v in available.items())
+        raise ValueError(f"collection='{collection}' not available for organism='{organism}'. Options:\n{options}")
+
+    suffix = _MSIGDB_SUFFIX[organism]
+    gmt_name = f"{_MSIGDB_COLLECTIONS[collection][1][organism]}.v{msigdb_version}.{suffix}.symbols.gmt"
+    gmt_path = Path(gmt_dir) / gmt_name
+    if not gmt_path.exists():
+        import urllib.request
+
+        url = f"https://data.broadinstitute.org/gsea-msigdb/msigdb/release/{msigdb_version}.{suffix}/{gmt_name}"
+        logger.info("Downloading %s", url)
+        urllib.request.urlretrieve(url, gmt_path)
+
+    # GMT line: set name, description, gene1, gene2, ...
+    rows = []
+    with open(gmt_path) as f:
+        for line in f:
+            name, _, *genes = line.rstrip("\n").split("\t")
+            rows += [(name, g) for g in genes]
+
+    net = pd.DataFrame(rows, columns=["source", "target"]).drop_duplicates(ignore_index=True)
+    net["source"] = net["source"].str.replace(
+        r"^(HALLMARK|GOBP|GOCC|GOMF|REACTOME|WP|BIOCARTA|MP|HP|PID|KEGG_MEDICUS|KEGG)_", "", regex=True
+    )
+    logger.info("%s: %d gene sets, %d genes", gmt_name, net["source"].nunique(), net["target"].nunique())
+    return net
 
 
 #####################################################################

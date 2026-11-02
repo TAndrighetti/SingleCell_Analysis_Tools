@@ -89,7 +89,7 @@ pip install -e .
 | `PlotModuleScoresUMAPs` | Embedding grid (UMAP by default, `basis=`) of module scores, diverging color scale centered at 0 |
 | `CalculateAUCellWithDecoupler` | Per-signature AUCell score (`decoupler.mt.aucell`), in [0, 1]. Sets not scored -> NaN. Optional sqrt(n_genes) division (`normalize_by_sqrt_n`, off by default) |
 | `PlotAUCellUMAPs` | Embedding grid (UMAP by default, `basis=`) of AUCell scores, sequential color scale from 0 |
-| `ScoreCellCycle` | S/G2M scores + phase (`sc.tl.score_genes_cell_cycle`, Tirosh et al. 2016 genes via `scib`, mouse orthologs). Evidence to split proliferating precursors from post-mitotic cells |
+| `ScoreCellCycle` | S/G2M scores + phase (`sc.tl.score_genes_cell_cycle`), genes read from a CSV (`phase` = S/G2M + gene column), optional UMAPs. Evidence to split proliferating precursors from post-mitotic cells |
 | `AssignLabelsFromScores` | Cluster x signature table (median score) + per-cluster `top1`/`top2`/`margin`/`purity`/`suggested_label` ("ambiguous" below `min_purity`), and `frac_cycling` if `phase` exists |
 | `PlotFinalAnnotation` | Map {cluster: label} into an ordered `adata.obs` column, then UMAPs (clusters vs labels) + marker dotplot. Warns about clusters left without a label (NaN) |
 
@@ -348,7 +348,7 @@ adata = CalculateAUCellWithDecoupler(adata, marker_genes_dic, layer="QC_filtered
 PlotAUCellUMAPs(adata)
 
 # 15b. Cell-cycle phase as extra evidence, then a suggested label per cluster
-adata = ScoreCellCycle(adata, organism="mouse", layer="QC_filtered_log1p")
+adata = ScoreCellCycle(adata, genes_csv="cell_cycle_genes_seurat_2019_human_mouse.csv", layer="QC_filtered_log1p")
 cluster_scores, summary = AssignLabelsFromScores(adata, groupby="leiden_res1", prefix="score_")
 summary  # top1, top2, margin, purity, suggested_label, frac_cycling
 ```
@@ -461,7 +461,7 @@ fig, ax = PlotWgcnaEnrichmentDotplot(enrichment_df, database=databases[0])
 
 ## Author
 
-Tahila Andrighetti — tahilaandrighetti@gmail.com
+Tahila Andrighetti — tahilaandrighetti@gmail.com | tahila@unicamp.br
 
 ---
 

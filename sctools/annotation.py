@@ -7,13 +7,13 @@ cluster, module scores and AUCell scores, plus plots for each.
 
 Ported from the annotation notebooks (`06sx.scNewFfar2_Annotation.ipynb`,
 `06sx.scNewFfar2_Annotation_ALRA.ipynb`, `06.scNeuSheng_Annotation.ipynb`).
-The manual/second-level helpers from the same notebooks (`ImportMarkers`,
-`Anota1`, `Anot2_with_Markers`, `InterDics`, `ScoreTableFromDics`) are not
-ported yet.
+The manual/second-level helpers from the same notebooks (`Anota1`,
+`Anot2_with_Markers`, `InterDics`, `ScoreTableFromDics`) are not ported yet.
 
 Typical usage order
 -------------------
 Markers and top DEGs per cluster:
+    ImportMarkers()             (marker table from Excel)
     MarkerInData()
     RankGenesByCluster()
     MeanExpressionByCluster()   (any gene list or marker dict)
@@ -27,7 +27,7 @@ AUCell scores (requires `decoupler`):
     CalculateAUCellWithDecoupler()
     PlotAUCellUMAPs()
 
-Cell cycle (requires `scib` for the gene lists):
+Cell cycle (gene table from a CSV):
     ScoreCellCycle()
 
 Label suggestion per cluster, with confidence:
@@ -39,7 +39,7 @@ Final annotation (map clusters to labels, UMAPs + marker dotplot):
 Quick start
 -----------
 >>> from sctools.annotation import (
-...     MarkerInData, RankGenesByCluster, PlotTopDegsHeatmap,
+...     ImportMarkers, MarkerInData, RankGenesByCluster, PlotTopDegsHeatmap,
 ...     CalculateModuleScores, PlotModuleScoresUMAPs,
 ...     CalculateAUCellWithDecoupler, PlotAUCellUMAPs,
 ...     ScoreCellCycle, AssignLabelsFromScores,
@@ -48,12 +48,13 @@ Quick start
 ...     adata, groupby="leiden_res1", filter_mt_ribo_hb=True, specific_markers=True,
 ... )
 >>> PlotTopDegsHeatmap(scaled_df, title="Top 10 DEGs per cluster")
->>> markers = MarkerInData({"Goblet": ["Muc2", "Tff3"]}, adata)
+>>> markers = ImportMarkers("markers.xlsx", sheet_name="broad", id_col="type", gene_col="gene")
+>>> markers = MarkerInData(markers, adata)
 >>> adata = CalculateModuleScores(adata, markers)
 >>> PlotModuleScoresUMAPs(adata)
 >>> adata = CalculateAUCellWithDecoupler(adata, markers)
 >>> PlotAUCellUMAPs(adata)
->>> adata = ScoreCellCycle(adata, organism="mouse")
+>>> adata = ScoreCellCycle(adata, genes_csv="cell_cycle_genes_seurat_2019_human_mouse.csv")
 >>> cluster_scores, summary = AssignLabelsFromScores(adata, groupby="leiden_res1", prefix="score_")
 """
 
@@ -72,6 +73,7 @@ from anndata import AnnData
 
 # Public API: names exported by `from sctools.annotation import *`
 __all__ = [
+    "ImportMarkers",
     "MarkerInData",
     "RankGenesByCluster",
     "MeanExpressionByCluster",
@@ -121,6 +123,45 @@ def _MatchGenes(genes, var_map: dict[str, str]) -> list[str]:
 
 ############################################
 # ── Markers ──────────────────────────────────────────────────────────────────
+
+def ImportMarkers(excel_path: str, sheet_name: str, id_col: str, gene_col: str) -> dict[str, list[str]]:
+    """
+    Read a marker table from an Excel sheet into a {cell type: genes} dict.
+
+    The sheet is in long format: one row per (cell type, gene) pair.
+
+    Parameters
+    ----------
+    excel_path
+        Path to the `.xlsx` file.
+    sheet_name
+        Sheet to read.
+    id_col
+        Column with the cell type / cluster name. Becomes the dict key.
+    gene_col
+        Column with the gene symbol.
+
+    Returns
+    -------
+    dict
+        {cell type: list of genes}, keys in the order they first appear in the
+        sheet. Keys and genes are stripped of spaces. Genes are capitalized
+        ("LGR5" -> "Lgr5") and empty cells are dropped.
+
+    Notes
+    -----
+    Rows with an empty `id_col` are dropped by `groupby`. Capitalization gives
+    mouse-style symbols. For human data, pass the result to `MarkerInData`,
+    which matches case-insensitively and returns the symbols as spelled in
+    the data. Do not use the raw dict directly as `var_names` on human data.
+    """
+    marker_table = pd.read_excel(excel_path, sheet_name=sheet_name)
+    grouped = marker_table.groupby(id_col, sort=False)[gene_col].apply(list).to_dict()
+    return {
+        str(cell).strip(): [str(g).strip().capitalize() for g in genes if pd.notna(g)]
+        for cell, genes in grouped.items()
+    }
+
 
 def MarkerInData(marker_genes: dict[str, list[str]], adata: AnnData) -> dict[str, list[str]]:
     """
@@ -627,15 +668,17 @@ def CalculateAUCellWithDecoupler(
 
 def ScoreCellCycle(
     adata: AnnData,
-    organism: str = "mouse",
+    genes_csv: str | Path,
+    gene_col: str = "mouse_symbol",
+    phase_col: str = "phase",
     layer: str = "QC_filtered_log1p",
+    plot_umap: bool = True,
 ) -> AnnData:
     """
     Score S and G2/M phases per cell and assign a cell-cycle phase.
 
-    Uses the Tirosh et al. (2016) S and G2/M gene lists as packaged by
-    `scib` (with real mouse orthologs for `organism="mouse"`), matched to
-    `adata.var_names` case-insensitively, then runs
+    Reads the S and G2/M genes from a CSV table, keeps the genes present in
+    `adata.var_names` (case-insensitive match), then runs
     `sc.tl.score_genes_cell_cycle` on `layer`.
 
     Parameters
@@ -643,11 +686,17 @@ def ScoreCellCycle(
     adata
         AnnData object. Writes `S_score`, `G2M_score` and `phase` to
         `adata.obs`.
-    organism
-        Organism of the gene symbols, passed to
-        `scib.preprocessing.get_cell_cycle_genes` (e.g. "mouse", "human").
+    genes_csv
+        CSV with one row per gene, e.g.
+        `cell_cycle_genes_seurat_2019_human_mouse.csv`.
+    gene_col
+        Column with the gene symbols, in the same organism as `adata`.
+    phase_col
+        Column with the phase of each gene. Values must be "S" and "G2M".
     layer
-        Layer with log-normalized expression.
+        Layer with log-normalized expression (not scaled).
+    plot_umap
+        If True, plot `phase`, `S_score` and `G2M_score` on the UMAP.
 
     Returns
     -------
@@ -657,36 +706,66 @@ def ScoreCellCycle(
 
     Notes
     -----
+    Genes not found in `adata.var_names` are dropped and listed in a
+    warning.
+
+    Domain note: `score_genes` compares each gene set with control genes of
+    similar mean expression, so `layer` must be log-normalized, not scaled
+    (scaling removes the mean used to pick the controls).
+
     Domain note: phase "G1" also covers G0 and post-mitotic cells, so
-    mature neutrophils are expected to be almost all "G1". In Xie et al.
-    (2020), proliferation is concentrated in G0 to G2 (GMP-like, proNeu,
-    preNeu), so the score is useful evidence to split precursors from
-    post-mitotic neutrophils. Here it is only evidence for annotation, do
-    not regress it out at this step.
+    mature cells (e.g. neutrophils, mature enterocytes) are expected to be
+    almost all "G1". The score is evidence for annotation. Do not regress
+    it out at this step.
 
-    Requires the `scib` package, imported lazily.
+    Domain note: Seurat's `cc.genes.updated.2019` (made with
+    `UpdateSymbolList`) replaces MCM2, RPA2 and BRIP1 by MCM7, POLR1B and
+    MRPL36. MCM2, RPA2 and BRIP1 are current HGNC symbols, so these three
+    changes come from symbol clashes, not from biology. Check the table if
+    it was built from that list.
     """
-    from scib.preprocessing import get_cell_cycle_genes
-
     _CheckLayer(adata, layer)
-    gene_map = get_cell_cycle_genes(organism)
+    table = pd.read_csv(genes_csv)
+    for col in (gene_col, phase_col):
+        if col not in table.columns:
+            raise KeyError(f"Column '{col}' not found in {genes_csv}. Available: {list(table.columns)}")
+    phases = set(table[phase_col].astype(str))
+    if phases != {"S", "G2M"}:
+        raise ValueError(f"Column '{phase_col}' must have only 'S' and 'G2M'. Found: {sorted(phases)}")
+
+    s_genes = table.loc[table[phase_col].eq("S"), gene_col].dropna().tolist()
+    g2m_genes = table.loc[table[phase_col].eq("G2M"), gene_col].dropna().tolist()
+
+    # Keep only genes present in the dataset (spelled as in adata.var_names, no duplicates)
     var_map = _VarMap(adata.var_names)
-    s_genes = _MatchGenes(gene_map.loc[gene_map["phase"] == "S", "gene_name"], var_map)
-    g2m_genes = _MatchGenes(gene_map.loc[gene_map["phase"] == "G2/M", "gene_name"], var_map)
-    if not s_genes or not g2m_genes:
+    s_found = _MatchGenes(s_genes, var_map)
+    g2m_found = _MatchGenes(g2m_genes, var_map)
+    logger.info(
+        "S: %d/%d genes in dataset. G2M: %d/%d genes in dataset.",
+        len(s_found), len(set(s_genes)), len(g2m_found), len(set(g2m_genes)),
+    )
+    missing = sorted({str(g) for g in [*s_genes, *g2m_genes] if str(g).upper() not in var_map})
+    if missing:
+        logger.warning("%d cell-cycle genes not in adata.var_names, dropped: %s", len(missing), missing)
+    if not s_found or not g2m_found:
         raise ValueError(
-            f"Cell-cycle genes not found in adata.var_names for organism='{organism}' "
-            f"(S: {len(s_genes)}, G2/M: {len(g2m_genes)} genes found)."
+            f"No S or G2M gene found in adata.var_names (S: {len(s_found)}, G2M: {len(g2m_found)}). "
+            f"Check that `gene_col` ('{gene_col}') is in the same organism as adata."
         )
 
-    sc.tl.score_genes_cell_cycle(adata, s_genes=s_genes, g2m_genes=g2m_genes, layer=layer, use_raw=False)
+    sc.tl.score_genes_cell_cycle(adata, s_genes=s_found, g2m_genes=g2m_found, layer=layer, use_raw=False)
 
     adata.uns.setdefault("annotation_params", {})["cell_cycle"] = {
         "layer": layer,
-        "organism": organism,
-        "n_s_genes": len(s_genes),
-        "n_g2m_genes": len(g2m_genes),
+        "genes_csv": str(genes_csv),
+        "gene_col": gene_col,
+        "n_s_genes": len(s_found),
+        "n_g2m_genes": len(g2m_found),
     }
+
+    if plot_umap:
+        sc.pl.umap(adata, color=["phase", "S_score", "G2M_score"], frameon=True, size=25)
+
     return adata
 
 
