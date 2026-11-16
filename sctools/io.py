@@ -123,7 +123,9 @@ def LoadSample(
     _RequireExists(path)
 
     loaders = {
-        "h5":  lambda: sc.read_10x_h5(path),
+        # gex_only=False: CellBender output built from non-10x input (e.g. DRAGEN MTX)
+        # has feature_type "NA" for every gene, so gex_only=True would drop all genes.
+        "h5":  lambda: sc.read_10x_h5(path, gex_only=False),
         "mtx": lambda: sc.read_10x_mtx(path, gex_only=False, prefix=prefix),
     }
     if format not in loaders:
@@ -133,6 +135,11 @@ def LoadSample(
         )
 
     adata = loaders[format]()
+    if adata.n_vars == 0:
+        raise ValueError(
+            f"No features loaded from {path} ({adata.n_obs} cells x 0 genes). "
+            "Check the file content and its feature_type column."
+        )
     adata.var_names_make_unique()
     adata.obs_names = adata.obs_names.astype(str)
 

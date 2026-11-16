@@ -241,3 +241,106 @@ def RunBbknnIntegration(
         n_pcs=n_pcs,
     )
     return adata
+
+
+def RunPrerankByCelltype(
+    de_long: pd.DataFrame,
+    net: pd.DataFrame,
+    *,
+    contrast_name: str = "KO.vs.WT",
+    celltype_col: str = "celltype",
+    gene_col: str = "gene_id",
+    value_col: str = "stat",
+    celltypes: Sequence[str] | None = None,
+    permutation_num: int = 1000,
+    min_size: int = 15,
+    max_size: int = 500,
+    seed: int = 42,
+    threads: int = 4,
+) -> pd.DataFrame:
+    """
+    Run gseapy prerank GSEA per celltype on a long-format DE table.
+
+    Same input and output as `RunGSEAByCelltype`, but with the original
+    Broad GSEA statistics.
+
+    Difference: `RunGSEAByCelltype` (decoupler) gives each pathway its own
+    permutation p-value and adjusts them by BH. gseapy computes the FDR from
+    the NES null distribution pooled across all pathways (Broad method).
+    `padj` here is this Broad FDR q-value, not a BH-adjusted p-value. It is
+    computed across the pathways of one celltype (not across celltypes).
+    Its lowest value is 1/permutation_num.
+
+    Genes are ranked by `value_col` inside each celltype (default "stat",
+    the DESeq2 Wald statistic). Genes with NaN in `value_col` are dropped.
+
+    Parameters
+    ----------
+    de_long : long-format DE table, one row per (celltype, gene).
+    net : decoupler-style network with columns "source" (pathway) and
+        "target" (gene), the same format `RunGSEAByCelltype` takes.
+    contrast_name : "{compare_condition}.vs.{normal_condition}". Used for
+        the `direction` column.
+    celltype_col, gene_col, value_col : columns of `de_long`.
+    celltypes : celltypes to run. If None, all in `de_long` (order of appearance).
+    permutation_num : number of gene set permutations.
+    min_size, max_size : pathway size limits, counted on the genes present
+        in the ranking (gseapy defaults, 15 and 500).
+    seed : random seed for the permutations.
+    threads : number of threads for gseapy.
+
+    Returns
+    -------
+    DataFrame with columns: celltype_col, pathway, NES, pval, padj,
+    lead_genes, direction. `pval` is the nominal p-value, `padj` the FDR
+    q-value, `lead_genes` the leading edge genes (";"-separated).
+    `direction` is compare_condition when NES > 0, normal_condition when
+    NES < 0, NaN otherwise.
+    """
+    import gseapy as gp
+
+    compare_condition, normal_condition = contrast_name.split(".vs.")
+
+    if celltypes is None:
+        celltypes = list(pd.unique(de_long[celltype_col]))
+
+    gene_sets = net.groupby("source")["target"].apply(list).to_dict()
+    ranked = de_long.dropna(subset=[value_col])
+
+    results = []
+    for celltype in celltypes:
+        logger.info("Prerank GSEA: %s", celltype)
+        rnk = ranked.loc[ranked[celltype_col] == celltype].set_index(gene_col)[value_col]
+
+        res = gp.prerank(
+            rnk=rnk,
+            gene_sets=gene_sets,
+            min_size=min_size,
+            max_size=max_size,
+            permutation_num=permutation_num,
+            seed=seed,
+            threads=threads,
+            outdir=None,
+            no_plot=True,
+            verbose=False,
+        ).res2d
+
+        # gseapy returns ES/NES as object dtype
+        gsea_df = pd.DataFrame({
+            celltype_col: celltype,
+            "pathway": res["Term"].to_numpy(),
+            "NES": pd.to_numeric(res["NES"]).to_numpy(),
+            "pval": pd.to_numeric(res["NOM p-val"]).to_numpy(),
+            "padj": pd.to_numeric(res["FDR q-val"]).to_numpy(),
+            "lead_genes": res["Lead_genes"].to_numpy(),
+        })
+        results.append(gsea_df.sort_values("NES", ascending=False))
+
+    gsea_long = pd.concat(results, ignore_index=True)
+
+    gsea_long["direction"] = np.select(
+        [gsea_long["NES"] > 0, gsea_long["NES"] < 0],
+        [compare_condition, normal_condition],
+        default=None,
+    )
+    return gsea_long

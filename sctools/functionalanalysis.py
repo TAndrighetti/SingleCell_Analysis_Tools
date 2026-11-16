@@ -18,10 +18,15 @@ Typical usage order:
     PrepareULMInput()              -> optional: build one celltype's ULM input from a long-format DE table (e.g. reloaded from CSV in a separate notebook); skip this if you still have `PseudoDESeq2`'s `data` in memory
     RunULM()                       -> run ULM for ONE input against any net, + optional barplot (pass `ax=` for a grid)
     RunGSEAByCelltype()            -> GSEA (ranked by DE stat) for every celltype of a long-format DE table, returns a long table for PlotSignificanceHeatmap
-    RunPrerankByCelltype()         -> same as RunGSEAByCelltype, but with gseapy prerank (Broad FDR). Use it for large collections (GO, Reactome)
     MeltActsPadjToLong()           -> combine several celltypes' stored acts/padj into one tidy table
     BuildSignificantFeatureTable() -> long-format table restricted to significant hits, + category/direction columns
     SummarizeFeatureCategories()   -> per-celltype/category summary from that table
+
+Over-representation analysis (ORA) of a gene list (e.g. up or down DEGs),
+offline, on any net (e.g. `LoadMSigDBCollection("go.bp")`):
+    RunOra()                       -> one-sided hypergeometric test + BH, for ONE gene list against a required background (the tested genes)
+    OraGeneTermTables()            -> gene-to-term table and gene x term 0/1 matrix of the significant terms
+    PlotOraBarplot()               -> bars = n genes, color = -log10(padj), gene names inside the bars
 
 The heatmap itself is `sctools.plots.PlotSignificanceHeatmap` -- generic
 (any long-format table with an x column, a y column, a color value column,
@@ -105,7 +110,6 @@ __all__ = [
     "PrepareULMInput",
     "RunULM",
     "RunGSEAByCelltype",
-    "RunPrerankByCelltype",
     "MeltActsPadjToLong",
     "BuildSignificantFeatureTable",
     "SummarizeFeatureCategories",
@@ -116,6 +120,11 @@ __all__ = [
     "SelectTopCorrelatedGenes",
     "LoadHallmarkCategories",
     "LoadMSigDBCollection",
+    "GetGseaLeadingEdges",
+    "PlotLeadingEdgeByCelltype",
+    "RunOra",
+    "OraGeneTermTables",
+    "PlotOraBarplot",
 ]
 
 
@@ -173,90 +182,123 @@ def LoadMSigDBCollection(
     organism: str = "mouse",
     gmt_dir: str | Path = "/home/tahila/0.resources",
     msigdb_version: str = "2025.1",
+    filter_sets: bool = False,
+    genes=None,
+    min_size: int = 15,
+    max_size: int = 500,
 ) -> pd.DataFrame:
     """
-    Load one native MSigDB collection (mouse or human) as a decoupler network.
+    Load an organism-specific MSigDB GMT as a decoupler network.
 
-    Uses the native GMT files of each organism from MSigDB (Mm for mouse, Hs
-    for human). For mouse data, use the mouse collections, not human sets
-    translated by orthology (e.g. `dc.op.resource("MSigDB")`), so
-    mouse-specific genes such as `Defa*` are kept. The file is read from
-    `gmt_dir` and downloaded from MSigDB if missing. `msigdb_version` is
-    fixed, so the gene sets do not change between runs.
-
-    The collection prefix is removed from the set names (GOBP_, HALLMARK_,
-    REACTOME_, ...), the same names as `dc.op.hallmark` and the hallmark
-    category JSON. Sets without a common prefix (e.g. cgp) are not changed.
-
-    Collections (organisms with a native MSigDB collection):
-        hallmark      hallmark                             mouse, human
-        go.bp         GO biological process                mouse, human
-        go.cc         GO cellular component                mouse, human
-        go.mf         GO molecular function                mouse, human
-        reactome      Reactome pathways                    mouse, human
-        wikipathways  WikiPathways                         mouse, human
-        biocarta      BioCarta pathways                    mouse, human
-        kegg          KEGG pathways (legacy)               human
-        kegg.medicus  KEGG MEDICUS pathways                human
-        pid           PID pathways                         human
-        cgp           chemical and genetic perturbations   mouse, human
-        tf.gtrd       TF targets (GTRD)                    mouse, human
-        tf.legacy     TF targets (legacy)                  human
-        mir.mirdb     miRNA targets (miRDB)                mouse, human
-        mir.legacy    miRNA targets (legacy)               human
-        celltype      cell type signatures                 mouse, human
-        positional    positional                           mouse, human
-        mpt           mammalian phenotype ontology         mouse
-        hpo           human phenotype ontology             human
-        immunesigdb   ImmuneSigDB                          human
-        vaccine       vaccine response                     human
-        oncogenic     oncogenic signatures                 human
-        cancer.3ca    cancer cell atlas                    human
-        cancer.cgn    cancer gene neighborhoods            human
-        cancer.cm     cancer modules                       human
-
-    Parameters
-    ----------
-    collection : one of the collections above.
-    organism : "mouse" or "human".
-    gmt_dir : folder of the GMT files.
-    msigdb_version : MSigDB release of the GMT files.
+    collection : str --> Collection defined in _MSIGDB_COLLECTIONS.
+    organism : str --> "mouse" or "human".
+    gmt_dir : str | Path --> Folder containing the GMT files.
+    msigdb_version : str --> Fixed MSigDB release.
+    filter_sets : bool --> Filter sets by size after intersecting with genes.
+    genes : iterable | None --> Genes in the ranking; required when filtering. 
+        - Provide if you have a speciqfic gene universe to intersect with the GMT sets. 
+        - If None, no filtering is applied.
+    min_size : int --> Minimum number of matched genes per set, inclusive.
+    max_size : int --> Maximum number of matched genes per set, inclusive.
 
     Returns
     -------
-    DataFrame with columns "source" (gene set) and "target" (gene), no duplicates.
+    pd.DataFrame
+        Unique source-target pairs. When filtering, contains only matched
+        genes from sets within the requested size range.
     """
     if organism not in _MSIGDB_SUFFIX:
-        raise ValueError(f"organism='{organism}' not valid. Options: {list(_MSIGDB_SUFFIX)}.")
+        raise ValueError(
+            f"organism='{organism}' not valid. "
+            f"Options: {list(_MSIGDB_SUFFIX)}."
+        )
 
-    available = {k: v for k, (v, stems) in _MSIGDB_COLLECTIONS.items() if organism in stems}
+    available = {
+        k: v
+        for k, (v, stems) in _MSIGDB_COLLECTIONS.items()
+        if organism in stems
+    }
     if collection not in available:
-        options = "\n".join(f"  {k:14s}{v}" for k, v in available.items())
-        raise ValueError(f"collection='{collection}' not available for organism='{organism}'. Options:\n{options}")
+        options = "\n".join(
+            f"  {k:14s}{v}" for k, v in available.items()
+        )
+        raise ValueError(
+            f"collection='{collection}' not available for "
+            f"organism='{organism}'. Options:\n{options}"
+        )
+
+    if filter_sets:
+        if genes is None:
+            raise ValueError(
+                "Provide the ranking genes in 'genes' when filter_sets=True."
+            )
+        if not 1 <= min_size <= max_size:
+            raise ValueError("Expected 1 <= min_size <= max_size.")
+
+        genes = set(genes)
+        if not genes:
+            raise ValueError("'genes' must not be empty.")
 
     suffix = _MSIGDB_SUFFIX[organism]
-    gmt_name = f"{_MSIGDB_COLLECTIONS[collection][1][organism]}.v{msigdb_version}.{suffix}.symbols.gmt"
-    gmt_path = Path(gmt_dir) / gmt_name
+    stem = _MSIGDB_COLLECTIONS[collection][1][organism]
+    gmt_name = f"{stem}.v{msigdb_version}.{suffix}.symbols.gmt"
+
+    gmt_dir = Path(gmt_dir)
+    gmt_dir.mkdir(parents=True, exist_ok=True)
+    gmt_path = gmt_dir / gmt_name
+
     if not gmt_path.exists():
         import urllib.request
 
-        url = f"https://data.broadinstitute.org/gsea-msigdb/msigdb/release/{msigdb_version}.{suffix}/{gmt_name}"
+        url = (
+            "https://data.broadinstitute.org/gsea-msigdb/msigdb/release/"
+            f"{msigdb_version}.{suffix}/{gmt_name}"
+        )
         logger.info("Downloading %s", url)
         urllib.request.urlretrieve(url, gmt_path)
 
     # GMT line: set name, description, gene1, gene2, ...
     rows = []
-    with open(gmt_path) as f:
+    with open(gmt_path, encoding="utf-8") as f:
         for line in f:
-            name, _, *genes = line.rstrip("\n").split("\t")
-            rows += [(name, g) for g in genes]
+            if not line.strip():
+                continue
+            name, _, *members = line.rstrip("\r\n").split("\t")
+            rows.extend((name, gene) for gene in members if gene)
 
-    net = pd.DataFrame(rows, columns=["source", "target"]).drop_duplicates(ignore_index=True)
+    net = pd.DataFrame(rows, columns=["source", "target"])
     net["source"] = net["source"].str.replace(
-        r"^(HALLMARK|GOBP|GOCC|GOMF|REACTOME|WP|BIOCARTA|MP|HP|PID|KEGG_MEDICUS|KEGG)_", "", regex=True
+        r"^(HALLMARK|GOBP|GOCC|GOMF|REACTOME|WP|BIOCARTA|MP|HP|PID|KEGG_MEDICUS|KEGG)_",
+        "",
+        regex=True,
     )
-    logger.info("%s: %d gene sets, %d genes", gmt_name, net["source"].nunique(), net["target"].nunique())
+    net = net.drop_duplicates(ignore_index=True)
+
+    if filter_sets:
+        n_before = net["source"].nunique()
+
+        # Count only genes present in the ranking.
+        net = net.loc[net["target"].isin(genes)].copy()
+        sizes = net.groupby("source")["target"].nunique()
+        keep = sizes.index[sizes.between(min_size, max_size)]
+        net = net.loc[net["source"].isin(keep)].reset_index(drop=True)
+
+        logger.info(
+            "Size filter [%d, %d]: %d of %d gene sets retained",
+            min_size,
+            max_size,
+            net["source"].nunique(),
+            n_before,
+        )
+
+    logger.info(
+        "%s: %d gene sets, %d genes",
+        gmt_name,
+        net["source"].nunique(),
+        net["target"].nunique(),
+    )
     return net
+
 
 
 #####################################################################
@@ -473,19 +515,28 @@ def RunGSEAByCelltype(
     Genes are ranked by `value_col` inside each celltype (default "stat":
     the DESeq2 Wald statistic from `PseudoDESeq2`, or the signed MAST
     statistic from `sctools.mast.RunMAST`). Genes with NaN in `value_col`
-    are dropped. `padj` is corrected by decoupler across the pathways of
-    one celltype (not across celltypes).
+    are dropped.
 
-    Permutation resolution: decoupler computes the GSEA p-value as the
-    fraction of permutations with an ES at least as extreme as the observed
-    one, without a +1 correction. When no permutation reaches it, p and
-    padj are exactly 0 (the truth is p < 1/times). With m pathways, BH needs
-    p < 0.05/m, so small `times` makes the significance calls depend on the
-    number of permutations, not on the effect. Rule of thumb: times > 2*m/0.05
-    (about 2000 for hallmark, m=50; about 41000 for Reactome, m~1000). A
-    warning is logged when padj == 0 appears and `times` is below this.
-    With enough permutations padj == 0 can still appear for strong
-    effects; report it as padj < m/times.
+    `padj` is the Benjamini-Hochberg (BH) adjusted p-value, computed by
+    decoupler across the pathways of one celltype (not across celltypes).
+    The `padj_method` column says "BH". It is not the Broad FDR q-value of
+    gseapy prerank (NES null pooled across pathways).
+
+    Permutation resolution: decoupler computes p as the fraction of null
+    ES with the same sign as the observed ES that are at least as extreme,
+    without a +1 correction. About half of the permutations have each sign,
+    so the smallest non-zero p is about 2/times. When no permutation
+    reaches the observed ES, p and padj are exactly 0. This is not an
+    estimate: it only says p is below the resolution. A warning is logged
+    when this happens.
+
+    Choosing `times`: BH compares the p-value at rank i with (i/m) * alpha,
+    so alpha/m is only the threshold for the smallest p-value (Benjamini
+    and Hochberg, 1995). The number of permutations needed depends on how
+    many pathways have small p-values, not on m alone. So do not fix
+    `times` from the collection size. Run with one `times`, rerun with a
+    larger one on the same input, and check that the significance calls
+    are stable.
 
     The output is long-format, ready for
     `sctools.plots.PlotSignificanceHeatmap(gsea_long, x=celltype_col,
@@ -500,16 +551,17 @@ def RunGSEAByCelltype(
     celltype_col, gene_col, value_col : columns of `de_long`.
     celltypes : celltypes to run. If None, all in `de_long` (order of appearance).
     times : number of permutations for the GSEA null distribution. See
-        "Permutation resolution" above.
+        "Choosing `times`" above.
     seed : random seed for the permutations.
     tmin : minimum number of genes of a pathway present in the ranking.
     verbose : passed to `dc.mt.gsea`.
 
     Returns
     -------
-    DataFrame with columns: celltype_col, pathway, NES, padj, direction.
-    `direction` is compare_condition when NES > 0, normal_condition when
-    NES < 0, NaN otherwise.
+    DataFrame with columns: celltype_col, pathway, NES, padj, padj_method,
+    direction. `padj_method` is always "BH". `direction` is
+    compare_condition when NES > 0, normal_condition when NES < 0, NaN
+    otherwise.
     """
     import decoupler as dc
 
@@ -539,129 +591,24 @@ def RunGSEAByCelltype(
             "pathway": score.columns,
             "NES": score.iloc[0].to_numpy(),
             "padj": padj.iloc[0].to_numpy(),
+            "padj_method": "BH",
         })
         results.append(gsea_df.sort_values("NES", ascending=False))
 
     gsea_long = pd.concat(results, ignore_index=True)
 
     # decoupler's permutation p-value has no +1 correction, so p (and padj)
-    # is exactly 0 when no permutation reaches the observed ES. With m
-    # pathways, BH needs p < 0.05/m, so resolving it needs times > m/0.05.
+    # is exactly 0 when no permutation reaches the observed ES, i.e. p is
+    # below the resolution (about 2/times).
     n_zero = int((gsea_long["padj"] == 0).sum())
-    n_tested = int(gsea_long.groupby(celltype_col).size().max())
-    suggested = int(np.ceil(2 * n_tested / 0.05 / 1000) * 1000)
-    if n_zero and times < suggested:
+    if n_zero:
         logger.warning(
             "GSEA: %d result(s) have padj == 0 (no permutation out of times=%d "
-            "reached the observed ES). This means p < 1/%d, not p = 0, and with "
-            "%d pathways tested the significance calls depend on the number of "
-            "permutations. Consider times >= %d.",
-            n_zero, times, times, n_tested, suggested,
+            "reached the observed ES). This means p is below the permutation "
+            "resolution (about 2/%d), not p = 0. Rerun with a larger `times` "
+            "and check that the significance calls are stable.",
+            n_zero, times, times,
         )
-
-    gsea_long["direction"] = np.select(
-        [gsea_long["NES"] > 0, gsea_long["NES"] < 0],
-        [compare_condition, normal_condition],
-        default=None,
-    )
-    return gsea_long
-
-
-def RunPrerankByCelltype(
-    de_long: pd.DataFrame,
-    net: pd.DataFrame,
-    *,
-    contrast_name: str = "KO.vs.WT",
-    celltype_col: str = "celltype",
-    gene_col: str = "gene_id",
-    value_col: str = "stat",
-    celltypes: Sequence[str] | None = None,
-    permutation_num: int = 1000,
-    min_size: int = 15,
-    max_size: int = 500,
-    seed: int = 42,
-    threads: int = 4,
-) -> pd.DataFrame:
-    """
-    Run gseapy prerank GSEA per celltype on a long-format DE table.
-
-    Same input and output as `RunGSEAByCelltype`, but with the original
-    Broad GSEA statistics. Use it for large collections (GO, Reactome).
-
-    Why: `RunGSEAByCelltype` (decoupler) gives each pathway its own
-    permutation p-value, so with m pathways it needs times > 2*m/0.05
-    permutations (about 200000 for GO BP). gseapy computes the FDR from the
-    NES null distribution pooled across all pathways (Broad method), so
-    1000 permutations are enough. `padj` is this FDR q-value. It is computed
-    across the pathways of one celltype (not across celltypes). Its lowest
-    value is 1/permutation_num.
-
-    Genes are ranked by `value_col` inside each celltype (default "stat",
-    the DESeq2 Wald statistic). Genes with NaN in `value_col` are dropped.
-
-    Parameters
-    ----------
-    de_long : long-format DE table, one row per (celltype, gene).
-    net : decoupler-style network with columns "source" (pathway) and
-        "target" (gene), the same format `RunGSEAByCelltype` takes.
-    contrast_name : "{compare_condition}.vs.{normal_condition}". Used for
-        the `direction` column.
-    celltype_col, gene_col, value_col : columns of `de_long`.
-    celltypes : celltypes to run. If None, all in `de_long` (order of appearance).
-    permutation_num : number of gene set permutations.
-    min_size, max_size : pathway size limits, counted on the genes present
-        in the ranking (gseapy defaults, 15 and 500).
-    seed : random seed for the permutations.
-    threads : number of threads for gseapy.
-
-    Returns
-    -------
-    DataFrame with columns: celltype_col, pathway, NES, pval, padj,
-    lead_genes, direction. `pval` is the nominal p-value, `padj` the FDR
-    q-value, `lead_genes` the leading edge genes (";"-separated).
-    `direction` is compare_condition when NES > 0, normal_condition when
-    NES < 0, NaN otherwise.
-    """
-    import gseapy as gp
-
-    compare_condition, normal_condition = contrast_name.split(".vs.")
-
-    if celltypes is None:
-        celltypes = list(pd.unique(de_long[celltype_col]))
-
-    gene_sets = net.groupby("source")["target"].apply(list).to_dict()
-    ranked = de_long.dropna(subset=[value_col])
-
-    results = []
-    for celltype in celltypes:
-        logger.info("Prerank GSEA: %s", celltype)
-        rnk = ranked.loc[ranked[celltype_col] == celltype].set_index(gene_col)[value_col]
-
-        res = gp.prerank(
-            rnk=rnk,
-            gene_sets=gene_sets,
-            min_size=min_size,
-            max_size=max_size,
-            permutation_num=permutation_num,
-            seed=seed,
-            threads=threads,
-            outdir=None,
-            no_plot=True,
-            verbose=False,
-        ).res2d
-
-        # gseapy returns ES/NES as object dtype
-        gsea_df = pd.DataFrame({
-            celltype_col: celltype,
-            "pathway": res["Term"].to_numpy(),
-            "NES": pd.to_numeric(res["NES"]).to_numpy(),
-            "pval": pd.to_numeric(res["NOM p-val"]).to_numpy(),
-            "padj": pd.to_numeric(res["FDR q-val"]).to_numpy(),
-            "lead_genes": res["Lead_genes"].to_numpy(),
-        })
-        results.append(gsea_df.sort_values("NES", ascending=False))
-
-    gsea_long = pd.concat(results, ignore_index=True)
 
     gsea_long["direction"] = np.select(
         [gsea_long["NES"] > 0, gsea_long["NES"] < 0],
@@ -694,6 +641,349 @@ def _BuildFeatureToCategoryMap(category_map: dict, prefix: str = "") -> dict:
                 feature_to_category[f"{prefix}{feature_clean}"] = category
 
     return feature_to_category
+
+
+def GetGseaLeadingEdges(
+    degs,
+    gsea_results,
+    net,
+    *,
+    celltype_col="celltype",
+    gene_col="gene_id",
+    value_col="stat",
+    extra_cols=(),
+    padj_threshold=0.05,
+):
+    """
+    Extract leading-edge genes for significant GSEA results.
+
+    degs : DataFrame --> Same gene-level statistics used in GSEA.
+    gsea_results : DataFrame --> Output of RunGSEAByCelltype.
+    net : DataFrame --> Same source-target network used in GSEA.
+    celltype_col : str --> Cell-type column.
+    gene_col : str --> Gene identifier column.
+    value_col : str --> Ranking statistic column. Must be the same one used
+        in the GSEA, so the leading edge matches the reported NES and padj.
+    extra_cols : list of str --> Other columns of `degs` copied to the output
+        (e.g. ["log2FoldChange"]). Not used for the ranking.
+    padj_threshold : float --> Select pathways below this adjusted p-value.
+
+    Returns
+    -------
+    DataFrame with one row per celltype, pathway and leading-edge gene.
+    """
+    import decoupler as dc
+
+    extra_cols = list(extra_cols)
+    missing = [c for c in extra_cols if c not in degs.columns]
+    if missing:
+        raise ValueError(
+            f"extra_cols not found in degs: {missing}. Available: {list(degs.columns)}."
+        )
+    base_cols = [celltype_col, "pathway", "NES", "padj", gene_col, value_col]
+    clash = [c for c in extra_cols if c in base_cols]
+    if clash:
+        raise ValueError(
+            f"extra_cols {clash} clash with output columns {base_cols}. "
+            "Rename them in degs first (e.g. padj -> gene_padj)."
+        )
+
+    columns = [*base_cols, *extra_cols]
+    selected = gsea_results.loc[
+        gsea_results["padj"] < padj_threshold
+    ].copy()
+
+    rows = []
+
+    for celltype, pathways in selected.groupby(celltype_col, sort=False):
+        # Keep the full ranking, not only significant DEGs.
+        df = (
+            degs.loc[
+                degs[celltype_col] == celltype,
+                [gene_col, value_col, *extra_cols],
+            ]
+            .dropna(subset=[gene_col, value_col])
+            .set_index(gene_col)
+        )
+
+        if df.index.has_duplicates:
+            raise ValueError(
+                f"{celltype}: duplicated genes. Apply the same duplicate "
+                "handling used to prepare the original GSEA input."
+            )
+
+        if not np.isfinite(df[value_col].to_numpy()).all():
+            raise ValueError(f"{celltype}: the ranking contains infinite values.")
+
+        for _, result in pathways.iterrows():
+            fig, leading_genes = dc.pl.leading_edge(
+                df,
+                net=net,
+                stat=value_col,
+                name=result["pathway"],
+                return_fig=True,
+            )
+            plt.close(fig)
+
+            for gene in leading_genes:
+                rows.append({
+                    celltype_col: celltype,
+                    "pathway": result["pathway"],
+                    "NES": result["NES"],
+                    "padj": result["padj"],
+                    gene_col: gene,
+                    value_col: df.at[gene, value_col],
+                    **{c: df.at[gene, c] for c in extra_cols},
+                })
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def PlotLeadingEdgeByCelltype(
+    leading_edges,
+    pathway,
+    *,
+    celltype_col="celltype",
+    gene_col="gene_id",
+    value_col="stat",
+    padj_threshold=0.05,
+    celltype_order=None,
+    gene_order=None,
+    min_pathways=1,
+    show_nes=True,
+    xtick_rotation=0,
+    cmap="RdBu_r",
+    vmax=None,
+    figsize=None,
+    save=None,
+):
+    """
+    Plot aligned leading-edge heatmaps for one or more pathways.
+
+    leading_edges : DataFrame --> Output of GetGseaLeadingEdges.
+    pathway : str | list[str] --> Exact pathway names.
+    celltype_col : str --> Cell-type column.
+    gene_col : str --> Gene identifier column.
+    value_col : str --> Statistic used for colors.
+    padj_threshold : float --> Select significant pathway-celltype pairs.
+    celltype_order : list | None --> Optional cell-type order.
+    gene_order : list | None --> Optional order/subset of displayed genes.
+    min_pathways : int --> Keep genes in the leading edge of at least this
+        many plotted pathways (in any celltype). 1 keeps all genes.
+    show_nes : bool --> Add the pathway NES to each cell-type label.
+    xtick_rotation : float --> Angle of the cell-type labels (e.g. 0 or 45).
+    cmap : str --> Diverging colormap.
+    vmax : float | None --> Symmetric color limit; automatic if None.
+    figsize : tuple | None --> Figure width and height.
+    save : str | None --> Optional output image path.
+
+    Returns
+    -------
+    fig, axes, matrices
+        Axes and plotted matrices are dictionaries keyed by pathway.
+    """
+    import textwrap
+
+    import seaborn as sns
+    from matplotlib.patches import Patch
+
+    # Mid gray, darker than the white center of the diverging colormap
+    missing_color = "#bdbdbd"
+
+    pathways = [pathway] if isinstance(pathway, str) else list(pathway)
+    pathways = list(dict.fromkeys(pathways))
+    if not pathways:
+        raise ValueError("Provide at least one pathway.")
+
+    df = leading_edges.loc[
+        leading_edges["pathway"].isin(pathways)
+        & leading_edges["padj"].lt(padj_threshold)
+    ].copy()
+
+    # Plot only pathways with significant leading edges; report the others.
+    missing = [p for p in pathways if p not in df["pathway"].values]
+    if missing:
+        print(f"No significant leading edges (padj < {padj_threshold}), not plotted: {missing}")
+    pathways = [p for p in pathways if p not in missing]
+    if not pathways:
+        raise ValueError("None of the given pathways has significant leading edges.")
+
+    keys = ["pathway", celltype_col, gene_col]
+    if df.duplicated(keys).any():
+        raise ValueError(
+            "Duplicated pathway-celltype-gene rows. "
+            "Select a single contrast before plotting."
+        )
+
+    if not np.isfinite(df[value_col].to_numpy(dtype=float)).all():
+        raise ValueError(f"'{value_col}' contains missing or infinite values.")
+
+    # Use the same gene rows in every panel.
+    if gene_order is None:
+        gene_order = (
+            df.groupby(gene_col, sort=False)
+            .size()
+            .sort_values(ascending=False, kind="stable")
+            .index.tolist()
+        )
+    else:
+        gene_order = list(dict.fromkeys(gene_order))
+        gene_order = [g for g in gene_order if g in set(df[gene_col])]
+
+    if min_pathways < 1:
+        raise ValueError("'min_pathways' must be >= 1.")
+
+    # Keep genes shared by at least `min_pathways` of the plotted pathways.
+    n_pathways = df.groupby(gene_col)["pathway"].nunique()
+    gene_order = [g for g in gene_order if n_pathways[g] >= min_pathways]
+
+    if not gene_order:
+        raise ValueError(
+            f"No leading-edge genes remain for plotting (min_pathways={min_pathways}, "
+            f"{len(pathways)} pathway(s) plotted)."
+        )
+
+    matrices = {}
+    labels = {}
+
+    for name in pathways:
+        sub = df.loc[df["pathway"].eq(name)]
+        significant_types = sub[celltype_col].drop_duplicates().tolist()
+
+        if celltype_order is None:
+            celltypes = significant_types
+        else:
+            celltypes = [
+                ct for ct in celltype_order if ct in significant_types
+            ]
+            celltypes += [
+                ct for ct in significant_types if ct not in celltypes
+            ]
+
+        matrix = sub.pivot(
+            index=gene_col,
+            columns=celltype_col,
+            values=value_col,
+        ).reindex(index=gene_order, columns=celltypes)
+
+        matrices[name] = matrix
+
+        if show_nes:
+            nes = sub.groupby(celltype_col, observed=True)["NES"].first()
+            labels[name] = [f"{ct}\nNES={nes.loc[ct]:.2f}" for ct in celltypes]
+        else:
+            labels[name] = celltypes
+
+    # One symmetric color scale for all panels.
+    displayed = np.concatenate([
+        matrix.to_numpy(dtype=float).ravel()
+        for matrix in matrices.values()
+    ])
+    finite = displayed[np.isfinite(displayed)]
+
+    if not finite.size:
+        raise ValueError("No values remain for the selected genes.")
+
+    limit = float(np.abs(finite).max()) if vmax is None else float(vmax)
+    if limit < 0 or not np.isfinite(limit):
+        raise ValueError("'vmax' must be finite and non-negative.")
+    limit = limit or 1.0
+
+    widths = [max(2, matrices[p].shape[1]) for p in pathways]
+
+    if figsize is None:
+        figsize = (
+            max(6, 1.05 * sum(widths) + 2.5),
+            max(4, 0.25 * len(gene_order) + 2.5),
+        )
+
+    fig = plt.figure(figsize=figsize, layout="constrained")
+    grid = fig.add_gridspec(
+        1,
+        len(pathways) + 1,
+        width_ratios=widths + [0.25],
+        wspace=0.08,
+    )
+
+    axes = {}
+    first_ax = None
+
+    for i, name in enumerate(pathways):
+        ax = fig.add_subplot(grid[0, i], sharey=first_ax)
+        if first_ax is None:
+            first_ax = ax
+        axes[name] = ax
+        # Masked cells (gene not in this leading edge) show the axes background
+        ax.set_facecolor(missing_color)
+
+        sns.heatmap(
+            matrices[name],
+            mask=matrices[name].isna(),
+            cmap=cmap,
+            center=0,
+            vmin=-limit,
+            vmax=limit,
+            linewidths=0.35,
+            linecolor="#dddddd",
+            cbar=False,
+            xticklabels=labels[name],
+            yticklabels=True,
+            ax=ax,
+        )
+
+        # Wrap long names to the panel width (about 10 characters per column)
+        ax.set_title(
+            textwrap.fill(name.replace("_", " "), width=10 * widths[i]),
+            fontsize=11,
+        )
+        ax.set_xlabel(celltype_col)
+        ax.set_ylabel("Leading-edge genes" if i == 0 else "")
+        # Angled labels are anchored at their right end, so they end under their column
+        plt.setp(
+            ax.get_xticklabels(),
+            rotation=xtick_rotation,
+            ha="right" if xtick_rotation else "center",
+            rotation_mode="anchor",
+        )
+        ax.tick_params(
+            axis="y",
+            rotation=0,
+            labelsize=9,
+            labelleft=(i == 0),
+            left=(i == 0),
+        )
+
+    cax = fig.add_subplot(grid[0, -1])
+    fig.colorbar(
+        first_ax.collections[0],
+        cax=cax,
+        label=value_col,
+    )
+    # Legend sits just above the colorbar, so it never overlaps the suptitle.
+    # Left-aligned, so the extra width goes to the right figure margin.
+    cax.legend(
+        handles=[Patch(facecolor=missing_color, edgecolor="#dddddd", label="not in leading edge")],
+        loc="lower left",
+        bbox_to_anchor=(0, 1.02),
+        borderaxespad=0,
+        frameon=False,
+    )
+
+    # Second title line states the gene filter, so each figure says what it shows
+    if min_pathways == 1:
+        gene_note = "All leading-edge genes"
+    else:
+        gene_note = f"Genes in the leading edge of at least {min_pathways} plotted pathways"
+    fig.suptitle(
+        f"Leading edges | GSEA adjusted p < {padj_threshold}\n{gene_note}",
+        fontsize=13,
+    )
+
+    if save is not None:
+        fig.savefig(save, dpi=300, bbox_inches="tight")
+
+    plt.show()
+    return fig, axes, matrices
 
 
 ##################################################
@@ -824,6 +1114,249 @@ def SummarizeFeatureCategories(
     return summary.sort_values([celltype_col, "dominant_direction", "category"])
 
 #################################################################
+
+
+#####################################################################
+#### Over-representation analysis (ORA)
+
+
+def RunOra(
+    gene_list: Sequence[str],
+    net: pd.DataFrame,
+    background: Sequence[str],
+    *,
+    min_size: int = 15,
+    max_size: int = 500,
+) -> pd.DataFrame:
+    """
+    Over-representation analysis (one-sided hypergeometric test) of one gene list.
+
+    Runs offline on any decoupler-style network with `source` (term) and
+    `target` (gene) columns, e.g. `LoadMSigDBCollection("go.bp", organism="mouse")`.
+    Call it once per gene list (e.g. up and down DEGs of one celltype).
+
+    Ported from `RunEnrichr` (01.scRNA_CODES/gseapy_ORA.ipynb) with three fixes:
+    - Gene names are matched as given. The old `.capitalize()` changed names
+      like H2-Ab1 -> H2-ab1 and mt-Nd1 -> Mt-nd1, so they did not match the
+      data. Use a collection of the same organism as the data (the native
+      mouse MSigDB GMTs use mouse symbols).
+    - The old `Overlap` was "k/n" (n = list size). Here the overlap is given
+      as `n_genes` (k) and `term_size` (K), i.e. Enrichr's "k/K".
+    - `background` is required. For DEGs, use the genes tested in the DE
+      (e.g. the genes of that celltype in the DE table), not all genes of
+      adata. Otherwise general terms of the tissue look enriched only because
+      their genes are expressed there.
+
+    Test: universe = background genes present in at least one term of `net`
+    (N genes). List = gene_list genes in the universe (n genes). For each term,
+    K = term genes in the universe, k = list genes in the term, and
+    p = P(X >= k) with X ~ Hypergeometric(N, K, n). Terms with K outside
+    [min_size, max_size] are not tested. padj is Benjamini-Hochberg across all
+    tested terms, including those with k = 0.
+
+    Parameters
+    ----------
+    gene_list : genes to test (e.g. DEGs up in one celltype). Every gene must
+        be in `background`.
+    net : DataFrame with `source` and `target` columns.
+    background : genes that could enter `gene_list` (the tested genes).
+    min_size, max_size : allowed term size K, counted inside the universe.
+
+    Returns
+    -------
+    DataFrame, one row per tested term, sorted by pvalue:
+        term, n_genes (k), term_size (K), fold_enrichment ((k/n) / (K/N)),
+        pvalue, padj, genes (list genes in the term, separated by ";").
+    """
+    from scipy.stats import false_discovery_control, hypergeom
+
+    if not 1 <= min_size <= max_size:
+        raise ValueError("Expected 1 <= min_size <= max_size.")
+    missing_cols = [c for c in ("source", "target") if c not in net.columns]
+    if missing_cols:
+        raise KeyError(f"net has no columns {missing_cols}. Available: {list(net.columns)}.")
+
+    background = set(background)
+    genes = set(gene_list)
+    if not genes:
+        raise ValueError("gene_list is empty.")
+    not_in_background = genes - background
+    if not_in_background:
+        raise ValueError(
+            f"{len(not_in_background)} gene(s) of gene_list are not in background, "
+            f"e.g. {sorted(not_in_background)[:5]}. The background must contain "
+            "every gene that could enter the list (the tested genes)."
+        )
+
+    # Universe: background genes annotated in at least one term.
+    net = net.loc[net["target"].isin(background), ["source", "target"]].drop_duplicates()
+    universe = set(net["target"])
+    hits = genes & universe
+    if not hits:
+        raise ValueError(
+            "No gene of gene_list is annotated in net. Check that gene names "
+            "and organism match the collection."
+        )
+    logger.info(
+        "ORA: %d of %d list genes are annotated (universe: %d genes).",
+        len(hits), len(genes), len(universe),
+    )
+
+    # Term size K inside the universe, then the size filter.
+    term_size = net.groupby("source")["target"].size()
+    term_size = term_size[term_size.between(min_size, max_size)]
+    if term_size.empty:
+        raise ValueError(f"No term has between {min_size} and {max_size} genes in the universe.")
+
+    in_list = net.loc[net["source"].isin(term_size.index) & net["target"].isin(hits)]
+    n_genes = in_list.groupby("source").size().reindex(term_size.index, fill_value=0)
+    hit_genes = (
+        in_list.groupby("source")["target"]
+        .agg(lambda g: ";".join(sorted(g)))
+        .reindex(term_size.index, fill_value="")
+    )
+
+    N, n = len(universe), len(hits)
+    # sf(k - 1) = P(X >= k)
+    pvalue = hypergeom.sf(n_genes.to_numpy() - 1, N, term_size.to_numpy(), n)
+
+    res = pd.DataFrame({
+        "term": term_size.index,
+        "n_genes": n_genes.to_numpy(),
+        "term_size": term_size.to_numpy(),
+        "fold_enrichment": (n_genes.to_numpy() / n) / (term_size.to_numpy() / N),
+        "pvalue": pvalue,
+        "padj": false_discovery_control(pvalue, method="bh"),
+        "genes": hit_genes.to_numpy(),
+    })
+    return res.sort_values(["pvalue", "n_genes"], ascending=[True, False]).reset_index(drop=True)
+
+
+def OraGeneTermTables(
+    ora_results: pd.DataFrame,
+    padj_threshold: float = 0.05,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Gene-to-term tables from the significant terms of `RunOra`
+    (e.g. to build a network in Cytoscape).
+
+    Returns
+    -------
+    gene_to_terms : one row per gene, with its significant terms joined by "; ".
+    gene_term_matrix : genes x terms, 1 if the gene is in the term, else 0.
+    Both are empty if no term has padj < padj_threshold.
+    """
+    sig = ora_results.loc[
+        (ora_results["padj"] < padj_threshold) & (ora_results["n_genes"] > 0),
+        ["term", "genes"],
+    ]
+    exploded = sig.assign(gene=sig["genes"].str.split(";")).explode("gene")
+
+    gene_to_terms = (
+        exploded.groupby("gene")["term"].agg("; ".join).reset_index(name="terms")
+    )
+    gene_term_matrix = pd.crosstab(exploded["gene"], exploded["term"]).clip(upper=1)
+    gene_term_matrix.columns.name = None
+    return gene_to_terms, gene_term_matrix
+
+
+def PlotOraBarplot(
+    ora_results: pd.DataFrame,
+    *,
+    padj_threshold: float = 0.05,
+    top_n: int | None = 20,
+    title: str = "",
+    color_scheme: str = "red",
+    max_label_len: int = 55,
+    n_lines: int = 2,
+    width: float = 28,
+    row_height: float = 0.55,
+    save: str | Path | None = None,
+) -> tuple[Figure, Axes] | tuple[None, None]:
+    """
+    Bar plot of significant ORA terms, with the list genes written in each bar.
+
+    Ported from `PlotGProfilerBarplot` (01.scRNA_CODES/gseapy_ORA.ipynb).
+    Bar length = `n_genes`, color = -log10(padj). Terms are sorted by
+    `n_genes` (as in the original), and `top_n` keeps the terms with most
+    genes, not the most significant ones.
+
+    Parameters
+    ----------
+    ora_results : output of `RunOra`. Only terms with padj < padj_threshold are shown.
+    top_n : number of terms to show. None shows all significant terms.
+    color_scheme : "red" (e.g. up genes) or "blue" (e.g. down genes).
+    max_label_len : longer term names are cut with "…".
+    n_lines : 2 or 3 lines of gene names inside each bar.
+    width, row_height : figure width and height per bar, in inches.
+    save : optional output path.
+
+    Returns
+    -------
+    fig, ax. (None, None) if no term passes the threshold.
+    """
+    import matplotlib
+    import matplotlib.colors as mcolors
+
+    cmaps = {"red": "Reds", "blue": "Blues"}
+    if color_scheme not in cmaps:
+        raise ValueError(f"color_scheme must be one of {list(cmaps)}, got {color_scheme!r}.")
+    if n_lines not in (2, 3):
+        raise ValueError(f"n_lines must be 2 or 3, got {n_lines}.")
+
+    dat = ora_results.loc[ora_results["padj"] < padj_threshold].copy()
+    if dat.empty:
+        logger.warning("PlotOraBarplot: no term with padj < %s.", padj_threshold)
+        return None, None
+
+    dat["score"] = -np.log10(dat["padj"].clip(lower=np.finfo(float).tiny))
+    dat = dat.sort_values("n_genes", ascending=False)
+    if top_n:
+        dat = dat.head(top_n)
+    labels = [
+        t if len(t) <= max_label_len else t[: max_label_len - 1] + "…"
+        for t in dat["term"].astype(str)
+    ]
+
+    # Light end of the colormap removed, so small values are still visible.
+    base = matplotlib.colormaps[cmaps[color_scheme]]
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        f"{cmaps[color_scheme]}_trunc", base(np.linspace(0.25, 1.0, 256))
+    )
+    norm = plt.Normalize(vmin=dat["score"].min(), vmax=dat["score"].max())
+
+    y = np.arange(len(dat))
+    fig, ax = plt.subplots(figsize=(width, max(3.0, row_height * len(dat) + 1.4)), dpi=160)
+    bars = ax.barh(y, dat["n_genes"], color=cmap(norm(dat["score"].to_numpy())), edgecolor="none")
+
+    # Gene names inside each bar, split in n_lines balanced lines.
+    for bar, genes, score in zip(bars, dat["genes"], dat["score"]):
+        genes = genes.split(";")
+        parts = np.array_split(genes, n_lines)
+        text = "\n".join(", ".join(p) for p in parts if len(p))
+        ax.text(
+            0.3, bar.get_y() + bar.get_height() / 2, text,
+            va="center", ha="left", fontsize=7, alpha=0.9, linespacing=1.2,
+            color="white" if norm(score) > 0.5 else "black",
+        )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("N GENES")
+    ax.set_xlim(0, dat["n_genes"].max() * 1.05)
+    ax.grid(axis="x", linestyle=":", alpha=0.25)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.02).set_label(r"$-\log_{10}(p_{\mathrm{adj}})$")
+
+    fig.suptitle(title, y=0.91, fontsize=16, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    if save is not None:
+        Path(save).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save, dpi=300, bbox_inches="tight")
+    return fig, ax
 
 
 #####################################################################

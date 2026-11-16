@@ -21,6 +21,10 @@ Typical usage order:
     PseudoDESeq2()                      -> DESeq2 contrast on raw pseudobulk counts (PyDESeq2)
     VolcanoGridByGroup()                -> volcano grid, one panel per celltype
 
+Single-cell DE with the Wilcoxon rank-sum test (scanpy) per celltype:
+    RunWilcoxonByCelltype()             -> cells as replicates, for exploration
+                                           (same output columns as PseudoDESeq2/RunMAST)
+
 Single-cell DE with MAST (hurdle model, via R) lives in `sctools.mast`. Its
 output uses the same column names (`log2FoldChange`, `padj`, `stat`), so
 `VolcanoGridByGroup` works on it too (pass `col_gene="gene_id"`).
@@ -43,6 +47,8 @@ import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 
+from sctools.preprocessing import CheckNormalizedLayer
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -51,6 +57,7 @@ __all__ = [
     "PseudoFeatSelection",
     "PseudoDESeq2",
     "VolcanoGridByGroup",
+    "RunWilcoxonByCelltype",
 ]
 
 
@@ -748,3 +755,171 @@ def VolcanoGridByGroup(
     else:
         plt.show()
         return None
+
+
+########################################################################################
+# ── 4. Single-cell DE (Wilcoxon) ───────────────────────────────────────────────────────
+
+def RunWilcoxonByCelltype(
+    adata: AnnData,
+    *,
+    celltype_col: str,
+    condition_col: str,
+    ref_level: str,
+    contrast_level: str,
+    log1p_layer: str,
+    celltypes: list[str] | None = None,
+    min_pct: float = 0.1,
+    min_cells_per_group: int = 3,
+) -> pd.DataFrame:
+    """
+    Wilcoxon rank-sum test, contrast_level vs ref_level, in each celltype.
+
+    Uses `sc.tl.rank_genes_groups(method="wilcoxon", tie_correct=True)` with
+    Benjamini-Hochberg correction inside each celltype. `adata` is never
+    modified: each celltype is tested on a small AnnData that holds only
+    `log1p_layer` and the condition column.
+
+    Domain note: every cell is treated as an independent replicate. With
+    several samples per condition, p-values are too small
+    (pseudoreplication). Use it for exploration, and compare with
+    `PseudoDESeq2` (pseudobulk) or `sctools.mast.RunMAST(model="glmer")`.
+
+    Parameters
+    ----------
+    adata : AnnData with log-normalized data in `log1p_layer`.
+    celltype_col : obs column with the celltype labels.
+    condition_col : obs column with the condition labels.
+    ref_level, contrast_level : levels compared. A positive log2FoldChange
+        means higher in `contrast_level`.
+    log1p_layer : layer with normalized + log1p data. Not raw counts and not
+        scaled data (scaled data has negative values and is rejected).
+    celltypes : celltypes to test. If None, all values of `celltype_col`
+        (category order if categorical).
+    min_pct : keep a gene if it is detected (value > 0) in at least this
+        fraction of the cells of ref_level OR contrast_level. Same rule as
+        `min.pct` in Seurat `FindMarkers`. The filter is applied before the
+        test, so fewer tests go into the BH correction. This is valid
+        because the filter does not use the difference between conditions.
+    min_cells_per_group : a celltype is skipped (with a warning) if
+        ref_level or contrast_level has fewer cells. The default 3 is the
+        Seurat `min.cells.group` default.
+
+    Returns
+    -------
+    Long DataFrame, one row per (celltype, tested gene), sorted by padj
+    inside each celltype. Column names follow `PseudoDESeq2` and `RunMAST`,
+    so `VolcanoGridByGroup(df, col_gene="gene_id")` works directly:
+        celltype, gene_id, stat, log2FoldChange, pvalue, padj,
+        pct_ref, pct_contrast, n_cells_ref, n_cells_contrast
+    `stat` is the Wilcoxon z-score (signed, use it for ranking).
+    `log2FoldChange` is computed by scanpy from the group means of the log1p
+    data (expm1 of each mean, then log2 of the ratio). For genes close to
+    zero in one condition it can be very large (+/-20 or more).
+    `pct_ref`, `pct_contrast` are fractions (0 to 1) of cells with value > 0.
+    """
+    for col in (celltype_col, condition_col):
+        if col not in adata.obs.columns:
+            raise KeyError(f"Column '{col}' not found in adata.obs.")
+    if log1p_layer not in adata.layers:
+        raise KeyError(
+            f"Layer '{log1p_layer}' not found. Available layers: {list(adata.layers.keys())}."
+        )
+    if not adata.var_names.is_unique:
+        raise ValueError("Gene names must be unique. Run adata.var_names_make_unique().")
+
+    condition = adata.obs[condition_col].astype(str)
+    for level in (ref_level, contrast_level):
+        if level not in set(condition):
+            raise ValueError(
+                f"Level '{level}' not found in adata.obs['{condition_col}']. "
+                f"Available levels: {sorted(condition.unique())}."
+            )
+
+    celltype = adata.obs[celltype_col].astype(str)
+    if celltypes is None:
+        col = adata.obs[celltype_col]
+        celltypes = list(col.cat.categories) if hasattr(col, "cat") else sorted(col.unique())
+    missing = [ct for ct in celltypes if ct not in set(celltype)]
+    if missing:
+        raise ValueError(
+            f"Celltypes not found in adata.obs['{celltype_col}']: {missing}. "
+            f"Available: {sorted(celltype.unique())}."
+        )
+
+    X = adata.layers[log1p_layer]
+    CheckNormalizedLayer(X)
+
+    results = []
+    for ct in celltypes:
+        mask = ((celltype == ct) & condition.isin([ref_level, contrast_level])).to_numpy()
+        obs = pd.DataFrame(
+            {condition_col: pd.Categorical(
+                condition[mask], categories=[ref_level, contrast_level]
+            )},
+            index=adata.obs_names[mask],
+        )
+        sub = AnnData(X=X[mask], obs=obs, var=pd.DataFrame(index=adata.var_names))
+
+        is_ref = (obs[condition_col] == ref_level).to_numpy()
+        n_ref, n_contrast = int(is_ref.sum()), int((~is_ref).sum())
+        if min(n_ref, n_contrast) < min_cells_per_group:
+            logger.warning(
+                "Skipping %s: %s has %d cells, %s has %d (need %d per group).",
+                ct, ref_level, n_ref, contrast_level, n_contrast, min_cells_per_group,
+            )
+            continue
+
+        # Fraction of cells with value > 0 per gene. On sparse data, mean(axis=0)
+        # gives a (1, n_genes) matrix, so np.asarray(...).ravel() makes it 1D.
+        detected = sub.X > 0
+        pct_ref = np.asarray(detected[is_ref].mean(axis=0)).ravel()
+        pct_contrast = np.asarray(detected[~is_ref].mean(axis=0)).ravel()
+
+        # Keep genes detected in at least min_pct of either condition. "Either"
+        # keeps genes that are on in one condition and off in the other.
+        keep = (pct_ref >= min_pct) | (pct_contrast >= min_pct)
+        if not keep.any():
+            logger.warning("Skipping %s: no gene passes min_pct=%s.", ct, min_pct)
+            continue
+        sub = sub[:, keep].copy()
+
+        sc.tl.rank_genes_groups(
+            sub,
+            groupby=condition_col,
+            groups=[contrast_level],
+            reference=ref_level,
+            method="wilcoxon",
+            corr_method="benjamini-hochberg",
+            tie_correct=True,
+            n_genes=sub.n_vars,  # rank all genes (old scanpy defaults to 100)
+        )
+
+        res = sc.get.rank_genes_groups_df(sub, group=contrast_level).rename(columns={
+            "names": "gene_id",
+            "scores": "stat",
+            "logfoldchanges": "log2FoldChange",
+            "pvals": "pvalue",
+            "pvals_adj": "padj",
+        })
+        res = res[["gene_id", "stat", "log2FoldChange", "pvalue", "padj"]]
+
+        pct = pd.DataFrame(
+            {"pct_ref": pct_ref[keep], "pct_contrast": pct_contrast[keep]},
+            index=sub.var_names,
+        )
+        res = res.join(pct, on="gene_id")
+        res["n_cells_ref"] = n_ref
+        res["n_cells_contrast"] = n_contrast
+        res.insert(0, "celltype", ct)
+        results.append(res.sort_values(["padj", "pvalue"], kind="stable"))
+
+        logger.info(
+            "%s: %d genes tested | %s: %d cells | %s: %d cells.",
+            ct, sub.n_vars, ref_level, n_ref, contrast_level, n_contrast,
+        )
+
+    if not results:
+        raise ValueError("No celltype could be tested (see warnings above).")
+
+    return pd.concat(results, ignore_index=True)

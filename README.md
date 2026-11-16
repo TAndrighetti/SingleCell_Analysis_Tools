@@ -118,6 +118,7 @@ pip install -e .
 | `PseudoFeatSelection` | Per-celltype gene filtering before DE (`decoupler` filter_by_expr/filter_by_prop) |
 | `PseudoDESeq2` | Run a DESeq2 contrast on raw pseudobulk counts for one celltype (PyDESeq2), with a minimum-replicates check |
 | `VolcanoGridByGroup` | Volcano plot grid, one panel per celltype/group |
+| `RunWilcoxonByCelltype` | Single-cell Wilcoxon DE per celltype (scanpy) on a log1p layer, with a Seurat-like `min_pct` gene filter. Cells are replicates, so use it for exploration. Same output columns as `PseudoDESeq2`/`RunMAST` |
 
 ### `sctools.functionalanalysis` — Feature-set / pathway activity (decoupler ULM)
 
@@ -128,6 +129,9 @@ pip install -e .
 | `MeltActsPadjToLong` | Combine several celltypes' stored acts/padj tables (dict or `pdata.uns`) into one tidy long-format table -- feed straight into `sctools.plots.PlotSignificanceHeatmap` |
 | `BuildSignificantFeatureTable` | Long-format table restricted to significant hits, + category/direction columns (optional category dict with prefix stripping, e.g. `"HALLMARK_"`) |
 | `SummarizeFeatureCategories` | Per-celltype/category summary (counts, mean score, dominant direction) |
+| `RunOra` | Over-representation analysis (hypergeometric + BH) of ONE gene list, offline, on any net (e.g. `LoadMSigDBCollection("go.bp")`). `background` is required: use the tested genes |
+| `OraGeneTermTables` | Gene-to-term table and gene x term 0/1 matrix of the significant `RunOra` terms (e.g. for Cytoscape) |
+| `PlotOraBarplot` | Bar plot of significant `RunOra` terms: length = n genes, color = -log10(padj), gene names inside the bars |
 
 ### `sctools.functionalanalysis` — Gene profile correlation (target gene vs all genes, across stages)
 

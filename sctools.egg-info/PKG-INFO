@@ -20,7 +20,7 @@ Requires-Dist: pytest-cov; extra == "dev"
 
 Single-cell RNA-seq analysis utilities built on top of [Scanpy](https://scanpy.readthedocs.io/) and [AnnData](https://anndata.readthedocs.io/).
 
-> IMPORTANT: STILL IN DEVELOPMENT!
+> ***IMPORTANT: STILL IN DEVELOPMENT!***
 
 ## Installation
 
@@ -107,7 +107,7 @@ pip install -e .
 | `PlotModuleScoresUMAPs` | Embedding grid (UMAP by default, `basis=`) of module scores, diverging color scale centered at 0 |
 | `CalculateAUCellWithDecoupler` | Per-signature AUCell score (`decoupler.mt.aucell`), in [0, 1]. Sets not scored -> NaN. Optional sqrt(n_genes) division (`normalize_by_sqrt_n`, off by default) |
 | `PlotAUCellUMAPs` | Embedding grid (UMAP by default, `basis=`) of AUCell scores, sequential color scale from 0 |
-| `ScoreCellCycle` | S/G2M scores + phase (`sc.tl.score_genes_cell_cycle`, Tirosh et al. 2016 genes via `scib`, mouse orthologs). Evidence to split proliferating precursors from post-mitotic cells |
+| `ScoreCellCycle` | S/G2M scores + phase (`sc.tl.score_genes_cell_cycle`), genes read from a CSV (`phase` = S/G2M + gene column), optional UMAPs. Evidence to split proliferating precursors from post-mitotic cells |
 | `AssignLabelsFromScores` | Cluster x signature table (median score) + per-cluster `top1`/`top2`/`margin`/`purity`/`suggested_label` ("ambiguous" below `min_purity`), and `frac_cycling` if `phase` exists |
 | `PlotFinalAnnotation` | Map {cluster: label} into an ordered `adata.obs` column, then UMAPs (clusters vs labels) + marker dotplot. Warns about clusters left without a label (NaN) |
 
@@ -136,6 +136,7 @@ pip install -e .
 | `PseudoFeatSelection` | Per-celltype gene filtering before DE (`decoupler` filter_by_expr/filter_by_prop) |
 | `PseudoDESeq2` | Run a DESeq2 contrast on raw pseudobulk counts for one celltype (PyDESeq2), with a minimum-replicates check |
 | `VolcanoGridByGroup` | Volcano plot grid, one panel per celltype/group |
+| `RunWilcoxonByCelltype` | Single-cell Wilcoxon DE per celltype (scanpy) on a log1p layer, with a Seurat-like `min_pct` gene filter. Cells are replicates, so use it for exploration. Same output columns as `PseudoDESeq2`/`RunMAST` |
 
 ### `sctools.functionalanalysis` — Feature-set / pathway activity (decoupler ULM)
 
@@ -146,6 +147,9 @@ pip install -e .
 | `MeltActsPadjToLong` | Combine several celltypes' stored acts/padj tables (dict or `pdata.uns`) into one tidy long-format table -- feed straight into `sctools.plots.PlotSignificanceHeatmap` |
 | `BuildSignificantFeatureTable` | Long-format table restricted to significant hits, + category/direction columns (optional category dict with prefix stripping, e.g. `"HALLMARK_"`) |
 | `SummarizeFeatureCategories` | Per-celltype/category summary (counts, mean score, dominant direction) |
+| `RunOra` | Over-representation analysis (hypergeometric + BH) of ONE gene list, offline, on any net (e.g. `LoadMSigDBCollection("go.bp")`). `background` is required: use the tested genes |
+| `OraGeneTermTables` | Gene-to-term table and gene x term 0/1 matrix of the significant `RunOra` terms (e.g. for Cytoscape) |
+| `PlotOraBarplot` | Bar plot of significant `RunOra` terms: length = n genes, color = -log10(padj), gene names inside the bars |
 
 ### `sctools.functionalanalysis` — Gene profile correlation (target gene vs all genes, across stages)
 
@@ -366,7 +370,7 @@ adata = CalculateAUCellWithDecoupler(adata, marker_genes_dic, layer="QC_filtered
 PlotAUCellUMAPs(adata)
 
 # 15b. Cell-cycle phase as extra evidence, then a suggested label per cluster
-adata = ScoreCellCycle(adata, organism="mouse", layer="QC_filtered_log1p")
+adata = ScoreCellCycle(adata, genes_csv="cell_cycle_genes_seurat_2019_human_mouse.csv", layer="QC_filtered_log1p")
 cluster_scores, summary = AssignLabelsFromScores(adata, groupby="leiden_res1", prefix="score_")
 summary  # top1, top2, margin, purity, suggested_label, frac_cycling
 ```
@@ -479,7 +483,7 @@ fig, ax = PlotWgcnaEnrichmentDotplot(enrichment_df, database=databases[0])
 
 ## Author
 
-Tahila Andrighetti — tahilaandrighetti@gmail.com
+Tahila Andrighetti — tahilaandrighetti@gmail.com | tahila@unicamp.br
 
 ---
 

@@ -14,6 +14,7 @@ sctools/plots.py
 sctools/preprocessing.py
 sctools/qc.py
 sctools/scenic.py
+sctools/trajectory.py
 sctools.egg-info/PKG-INFO
 sctools.egg-info/SOURCES.txt
 sctools.egg-info/dependency_links.txt

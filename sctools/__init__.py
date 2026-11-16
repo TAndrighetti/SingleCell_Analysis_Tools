@@ -22,7 +22,7 @@ if not _sctools_logger.handlers:
     _sctools_logger.addHandler(_handler)
     _sctools_logger.setLevel(logging.INFO)
 
-from sctools.plots import PlotHeatmap, PlotSignificanceHeatmap, PlotSampleComposition
+from sctools.plots import PlotHeatmap, PlotSignificanceHeatmap, PlotSignificantHeatmap, PlotSampleComposition
 from sctools.io import CatAdata
 from sctools.networks import FilterKnowledgeNetworks
 from sctools.scenic import (
@@ -73,6 +73,8 @@ from sctools.annotation import (
     RankGenesByCluster,
     MeanExpressionByCluster,
     PlotTopDegsHeatmap,
+    GeneSetOverlap,
+    PlotMetricsViolinGrid,
     CalculateModuleScores,
     PlotModuleScoresUMAPs,
     CalculateAUCellWithDecoupler,
@@ -107,6 +109,7 @@ from sctools.degs import (
     PseudoFeatSelection,
     PseudoDESeq2,
     VolcanoGridByGroup,
+    RunWilcoxonByCelltype,
 )
 
 from sctools.functionalanalysis import (
@@ -121,6 +124,9 @@ from sctools.functionalanalysis import (
     CalculateGeneProfileCorrelations,
     CalculateGeneCellCorrelations,
     SelectTopCorrelatedGenes,
+    RunOra,
+    OraGeneTermTables,
+    PlotOraBarplot,
 )
 
 from sctools.qc import (
@@ -211,6 +217,7 @@ __all__ = [
     # Generic plots
     "PlotHeatmap",
     "PlotSignificanceHeatmap",
+    "PlotSignificantHeatmap",
     "PlotSampleComposition",
     # Preprocessing
     "NormalizeHvgPcaKnn",
@@ -226,6 +233,8 @@ __all__ = [
     "RankGenesByCluster",
     "MeanExpressionByCluster",
     "PlotTopDegsHeatmap",
+    "GeneSetOverlap",
+    "PlotMetricsViolinGrid",
     "CalculateModuleScores",
     "PlotModuleScoresUMAPs",
     "CalculateAUCellWithDecoupler",
@@ -256,6 +265,7 @@ __all__ = [
     "PseudoFeatSelection",
     "PseudoDESeq2",
     "VolcanoGridByGroup",
+    "RunWilcoxonByCelltype",
     # Functional analysis (hallmark/pathway activity, decoupler ULM)
     "PrepareULMInput",
     "RunULM",
@@ -268,6 +278,10 @@ __all__ = [
     "CalculateGeneProfileCorrelations",
     "CalculateGeneCellCorrelations",
     "SelectTopCorrelatedGenes",
+    # Over-representation analysis (ORA)
+    "RunOra",
+    "OraGeneTermTables",
+    "PlotOraBarplot",
     # Ambient RNA
     "AmbientRNA",
     # Doublets

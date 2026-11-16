@@ -9,6 +9,8 @@ PlotHeatmap             – generic heatmap from a long-format DataFrame
 PlotSignificanceHeatmap – generic value+significance heatmap (score/log2FC
                           colored, "*" by p-value/padj threshold, optional
                           category sidebar) from a long-format DataFrame
+PlotSignificantHeatmap  – variation for wide % and p-value tables (e.g. from
+                          annotation.GeneSetOverlap), value + stars in each cell
 PlotQcViolins           – violin grid per QC metric, grouped by sample
 PlotMetricPairs         – paired boxplot comparing two AnnData sets (before/after)
 PlotCovariates          – 4-panel covariate overview (violin × 3 + scatter)
@@ -151,6 +153,7 @@ def PlotSignificanceHeatmap(
     ylabel: str = "",
     cbar_label: str | None = None,
     category_legend_title: str = "Category",
+    vlines: list[float] | None = None,
     plot: bool = True,
     save: str | Path | None = None,
 ) -> tuple:
@@ -188,6 +191,11 @@ def PlotSignificanceHeatmap(
     title, figsize, cmap, center, xlabel, ylabel : passed through to the plot.
     cbar_label : colorbar label -- defaults to `value_col`.
     category_legend_title : legend title for the category sidebar.
+    vlines : optional x positions of vertical black lines, in column units
+        (a line at 2 is drawn between the 2nd and 3rd columns), e.g. to
+        separate groups of columns. They are drawn before saving and
+        showing, because this function calls `plt.show()` itself: lines
+        added after the call land on a new, empty figure.
     plot : whether to render the figure. Set False to just get the pivoted tables back.
     save : path to save the figure to. `None` skips saving.
 
@@ -302,6 +310,9 @@ def PlotSignificanceHeatmap(
                 frameon=False,
             )
 
+        for position in vlines or []:
+            ax.axvline(position, color="black", linewidth=1.5)
+
         plt.tight_layout()
 
         if save is not None:
@@ -311,6 +322,70 @@ def PlotSignificanceHeatmap(
         plt.show()
 
     return value_table, padj_table, annot_table
+
+
+def PlotSignificantHeatmap(
+    pct_table: pd.DataFrame,
+    pval_table: pd.DataFrame,
+    title: str = "Cluster-marker overlap (% with significance)",
+    figsize: tuple[float, float] = (10, 8),
+    cmap: str = "viridis",
+    significance_levels: dict[float, str] = {0.01: "**", 0.05: "*"},
+    cbar_label: str = "% overlap",
+    center: float | None = None,
+) -> None:
+    """Heatmap of % values with the value and stars written in each cell.
+
+    Variation of `PlotSignificanceHeatmap` for wide tables, e.g. the
+    ``"pct"`` and ``"pval"`` outputs of `sctools.annotation.GeneSetOverlap`
+    (rows = clusters, columns = cell types). Each cell shows the % with one
+    decimal plus a star symbol from `significance_levels`.
+
+    Parameters
+    ----------
+    pct_table : wide DataFrame with the values used for color and text.
+    pval_table : p-values with the same rows and columns as `pct_table`.
+    title, figsize, cmap, cbar_label, center : passed to the plot.
+    significance_levels : {threshold: symbol}. A cell gets the symbol of
+        the smallest threshold its p-value is below or equal to.
+    """
+    import seaborn as sns
+
+    pct_df = pct_table.astype(float)
+    pval_df = pval_table.astype(float).reindex_like(pct_df)
+
+    # Text of each cell: value with one decimal, then the stars
+    annot = pct_df.copy().astype(str)
+    for i in range(pct_df.shape[0]):
+        for j in range(pct_df.shape[1]):
+            pval = pval_df.iloc[i, j]
+            stars = ""
+            for thr, sym in sorted(significance_levels.items()):
+                if pval <= thr:
+                    stars = sym
+                    break
+            annot.iloc[i, j] = f"{pct_df.iloc[i, j]:.1f}{stars}"
+
+    plt.figure(figsize=figsize)
+    ax = sns.heatmap(
+        pct_df,
+        cmap=cmap,
+        annot=annot,
+        fmt="",
+        cbar_kws={"label": cbar_label},
+        linewidths=0.4,
+        linecolor="gray",
+        center=center,
+    )
+    ax.grid(False)
+
+    plt.title(title, fontsize=14, weight="bold", pad=12)
+    plt.xlabel("Cell type / Marker set")
+    plt.ylabel("Cluster")
+    plt.yticks(rotation=0)
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.show()
 
 
 # ── QC violins ────────────────────────────────────────────────────────────────

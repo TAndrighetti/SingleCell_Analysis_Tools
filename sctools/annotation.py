@@ -8,7 +8,8 @@ cluster, module scores and AUCell scores, plus plots for each.
 Ported from the annotation notebooks (`06sx.scNewFfar2_Annotation.ipynb`,
 `06sx.scNewFfar2_Annotation_ALRA.ipynb`, `06.scNeuSheng_Annotation.ipynb`).
 The manual/second-level helpers from the same notebooks (`Anota1`,
-`Anot2_with_Markers`, `InterDics`, `ScoreTableFromDics`) are not ported yet.
+`Anot2_with_Markers`, `ScoreTableFromDics`) are not ported yet. `InterDics`
+is ported as `GeneSetOverlap`.
 
 Typical usage order
 -------------------
@@ -18,6 +19,13 @@ Markers and top DEGs per cluster:
     RankGenesByCluster()
     MeanExpressionByCluster()   (any gene list or marker dict)
     PlotTopDegsHeatmap()
+
+Metric violins per cluster (e.g. QC metrics):
+    PlotMetricsViolinGrid()
+
+Overlap of top DEGs with a marker list (% and Fisher p-value):
+    GeneSetOverlap()
+    sctools.plots.PlotSignificantHeatmap()
 
 Module scores (Scanpy `sc.tl.score_genes`):
     CalculateModuleScores()
@@ -54,13 +62,14 @@ Quick start
 >>> PlotModuleScoresUMAPs(adata)
 >>> adata = CalculateAUCellWithDecoupler(adata, markers)
 >>> PlotAUCellUMAPs(adata)
->>> adata = ScoreCellCycle(adata, genes_csv="cell_cycle_genes_seurat_2019_human_mouse.csv")
+>>> adata, cc_df = ScoreCellCycle(adata, genes_csv="cell_cycle_genes_seurat_2019_human_mouse.csv")
 >>> cluster_scores, summary = AssignLabelsFromScores(adata, groupby="leiden_res1", prefix="score_")
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 from pathlib import Path
 
@@ -70,6 +79,7 @@ import pandas as pd
 import scanpy as sc
 import seaborn as sns
 from anndata import AnnData
+from scipy.stats import fisher_exact
 
 # Public API: names exported by `from sctools.annotation import *`
 __all__ = [
@@ -79,10 +89,12 @@ __all__ = [
     "MeanExpressionByCluster",
     "PlotTopDegsHeatmap",
     "PlotTopDEGsHeatmap",
+    "GeneSetOverlap",
     "CalculateModuleScores",
     "PlotModuleScoresUMAPs",
     "CalculateAUCellWithDecoupler",
     "PlotAUCellUMAPs",
+    "PlotMetricsViolinGrid",
     "ScoreCellCycle",
     "AssignLabelsFromScores",
     "PlotFinalAnnotation",
@@ -462,6 +474,97 @@ def PlotTopDegsHeatmap(
 PlotTopDEGsHeatmap = PlotTopDegsHeatmap
 
 
+# ── Overlap between gene sets ────────────────────────────────────────────────
+
+def GeneSetOverlap(
+    row_sets: dict[str, list[str]],
+    col_sets: dict[str, list[str]],
+    mode: str = "pct",
+    universe_size: int = 20000,
+) -> pd.DataFrame:
+    """
+    Overlap table between two dicts of gene lists.
+
+    Typical use: rows are clusters (e.g. `cluster_genes` from
+    `RankGenesByCluster`) and columns are cell types from a marker list.
+    Ported from `InterDics` in the annotation notebooks.
+
+    Parameters
+    ----------
+    row_sets
+        {row name: genes}. Keys become the table rows.
+    col_sets
+        {column name: genes}. Keys become the table columns.
+    mode
+        What each cell holds:
+
+        * ``"list"``  -- genes in common, as a comma-separated string
+        * ``"count"`` -- number of genes in common
+        * ``"pct"``   -- % of the row set that is in the column set
+        * ``"pval"``  -- one-sided Fisher exact p-value (enrichment)
+        * ``"both"``  -- ``"pct% (pval)"`` as text
+    universe_size
+        Total number of genes in the background, used for the Fisher test.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Rows from `row_sets`, columns from `col_sets`. Numeric for
+        ``"count"``, ``"pct"`` and ``"pval"``; text for ``"list"`` and ``"both"``.
+
+    Notes
+    -----
+    Domain note: the Fisher p-value depends on `universe_size`. The right
+    universe is the set of genes that could enter both lists (e.g. the
+    genes tested by `rank_genes_groups`). A bigger universe gives smaller
+    p-values. The p-values are not corrected for multiple testing
+    (rows x columns tests), so use them as a guide for annotation, not as
+    a formal test.
+    """
+    modes = ("list", "count", "pct", "pval", "both")
+    if mode not in modes:
+        raise ValueError(f"Unknown mode: {mode!r}. Choose one of: {list(modes)}")
+
+    table = pd.DataFrame(index=list(row_sets), columns=list(col_sets), dtype=object)
+
+    for row_key, row_genes in row_sets.items():
+        set_a = set(row_genes)
+        for col_key, col_genes in col_sets.items():
+            set_b = set(col_genes)
+            inter = set_a & set_b
+
+            if mode == "list":
+                table.loc[row_key, col_key] = ", ".join(sorted(inter))
+                continue
+            if mode == "count":
+                table.loc[row_key, col_key] = len(inter)
+                continue
+
+            # 2x2 contingency table for the one-sided Fisher test
+            a = len(inter)               # in row set and in column set
+            b = len(set_a) - a           # in row set only
+            c = len(set_b) - a           # in column set only
+            d = universe_size - (a + b + c)  # in neither
+            if d < 0:
+                raise ValueError(
+                    f"universe_size={universe_size} is smaller than the union of "
+                    f"'{row_key}' and '{col_key}' ({a + b + c} genes)."
+                )
+            pct = 100 * a / len(set_a) if set_a else 0.0
+            _, pval = fisher_exact([[a, b], [c, d]], alternative="greater")
+
+            if mode == "pct":
+                table.loc[row_key, col_key] = pct
+            elif mode == "pval":
+                table.loc[row_key, col_key] = pval
+            else:
+                table.loc[row_key, col_key] = f"{pct:.1f}% ({pval:.1e})"
+
+    if mode in ("count", "pct", "pval"):
+        table = table.apply(pd.to_numeric)
+    return table
+
+
 ############################################
 # ── Module scores (sc.tl.score_genes) ───────────────────────────────────────
 
@@ -673,7 +776,7 @@ def ScoreCellCycle(
     phase_col: str = "phase",
     layer: str = "QC_filtered_log1p",
     plot_umap: bool = True,
-) -> AnnData:
+) -> tuple[AnnData, pd.DataFrame]:
     """
     Score S and G2/M phases per cell and assign a cell-cycle phase.
 
@@ -700,9 +803,13 @@ def ScoreCellCycle(
 
     Returns
     -------
-    AnnData
+    adata : AnnData
         Same object (modified in place). Parameters are recorded in
         `adata.uns["annotation_params"]["cell_cycle"]`.
+    cc_df : pd.DataFrame
+        One row per cell (index = `adata.obs_names`), with columns
+        `S_score`, `G2M_score` and `phase`. It is a copy, so editing it
+        does not change `adata.obs`.
 
     Notes
     -----
@@ -766,7 +873,7 @@ def ScoreCellCycle(
     if plot_umap:
         sc.pl.umap(adata, color=["phase", "S_score", "G2M_score"], frameon=True, size=25)
 
-    return adata
+    return adata, adata.obs[["S_score", "G2M_score", "phase"]].copy()
 
 
 # ── Cluster-level label suggestion from scores ───────────────────────────────
@@ -1075,6 +1182,16 @@ def _PercentileLimits(
     return [lo for lo, _ in pairs], [hi for _, hi in pairs]
 
 
+def _GroupSubsets(adata: AnnData, groupby: str | None) -> list[tuple[str | None, AnnData]]:
+    """(group, subset) pairs: the whole object when `groupby` is None, else one subset per group."""
+    if groupby is None:
+        return [(None, adata)]
+    if groupby not in adata.obs:
+        raise ValueError(f"groupby='{groupby}' not in adata.obs. Options: {list(adata.obs.columns)}.")
+    groups = adata.obs[groupby].astype("category").cat.remove_unused_categories().cat.categories
+    return [(group, adata[adata.obs[groupby] == group]) for group in groups]
+
+
 def PlotModuleScoresUMAPs(
     adata: AnnData,
     score_names: list[str] | None = None,
@@ -1086,6 +1203,7 @@ def PlotModuleScoresUMAPs(
     show_colorbar: bool = True,
     basis: str = "umap",
     prefix: str = "score_",
+    groupby: str | None = None,
 ):
     """
     Plot one embedding (UMAP by default) per module score, on a diverging
@@ -1121,11 +1239,16 @@ def PlotModuleScoresUMAPs(
     prefix
         Column prefix used for the default `score_names` and removed from
         the panel titles.
+    groupby
+        Optional `adata.obs` column (e.g. "condition"). If given, one figure
+        per group, with only the cells of that group. Color limits are
+        computed on all cells, so the groups share the same scale.
 
     Returns
     -------
-    matplotlib.figure.Figure or None
-        None if there is no column to plot.
+    matplotlib.figure.Figure, dict or None
+        The figure, or {group: figure} when `groupby` is given. None if there
+        is no column to plot.
     """
     if score_names is None:
         score_names = [c for c in adata.obs.columns if c.startswith(prefix)]
@@ -1137,15 +1260,34 @@ def PlotModuleScoresUMAPs(
     # White at 0 only where the color range crosses 0 (matplotlib needs vmin < 0 < vmax)
     vcenter = [0 if lo is not None and lo < 0 < hi else None for lo, hi in zip(vmin, vmax)]
 
-    with plt.rc_context({"figure.figsize": figsize}):  # size of each panel
-        return sc.pl.embedding(
-            adata, basis=basis, color=score_names,
-            title=[c.removeprefix(prefix) for c in score_names],
-            ncols=min(ncols, len(score_names)), color_map=cmap,
-            vmin=vmin, vmax=vmax, vcenter=vcenter, frameon=False,
-            colorbar_loc=("right" if show_colorbar else None),
-            show=False, return_fig=True,
-        )
+    figs = {}
+    for group, sub in _GroupSubsets(adata, groupby):
+        titles = [c.removeprefix(prefix) for c in score_names]
+        if group is not None:
+            titles = [f"{group} | {t}" for t in titles]
+
+        with plt.rc_context({"figure.figsize": figsize}):  # size of each panel
+            fig = sc.pl.embedding(
+                sub, basis=basis, color=score_names, title=titles,
+                ncols=min(ncols, len(score_names)), color_map=cmap,
+                vmin=vmin, vmax=vmax, vcenter=vcenter, frameon=False,
+                colorbar_loc=("right" if show_colorbar else None),
+                show=False, return_fig=True,
+            )
+
+        # With vcenter=0 the negative side takes half of the colorbar, even when its range is short.
+        # The default ticks follow the positive side, so that half had no labels: add two ticks there.
+        if show_colorbar:
+            panels = [ax for ax in fig.axes if ax.collections and ax.collections[0].colorbar is not None]
+            for ax, lo, hi, center in zip(panels, vmin, vmax, vcenter):
+                if center is not None:
+                    cbar = ax.collections[0].colorbar
+                    positive = [t for t in cbar.get_ticks() if 0 <= t <= hi]
+                    ticks = [lo, lo / 2, *positive]
+                    cbar.set_ticks(ticks, labels=[f"{t:.3g}" for t in ticks])
+        figs[group] = fig
+
+    return figs[None] if groupby is None else figs
 
 
 def PlotAUCellUMAPs(
@@ -1159,6 +1301,7 @@ def PlotAUCellUMAPs(
     show_colorbar: bool = True,
     basis: str = "umap",
     prefix: str = "aucell_",
+    groupby: str | None = None,
 ):
     """
     Plot one embedding (UMAP by default) per AUCell score, on a sequential
@@ -1191,11 +1334,16 @@ def PlotAUCellUMAPs(
     prefix
         Column prefix used for the default `cols` and removed from the
         panel titles.
+    groupby
+        Optional `adata.obs` column (e.g. "condition"). If given, one figure
+        per group, with only the cells of that group. Color limits are
+        computed on all cells, so the groups share the same scale.
 
     Returns
     -------
-    matplotlib.figure.Figure or None
-        None if there is no column to plot.
+    matplotlib.figure.Figure, dict or None
+        The figure, or {group: figure} when `groupby` is given. None if there
+        is no column to plot.
     """
     if cols is None:
         cols = [c for c in adata.obs.columns if c.startswith(prefix)]
@@ -1207,12 +1355,112 @@ def PlotAUCellUMAPs(
     # AUCell is never negative, so the scale always starts at 0
     vmin = [0.0 if hi is not None else None for hi in vmax]
 
-    with plt.rc_context({"figure.figsize": figsize}):  # size of each panel
-        return sc.pl.embedding(
-            adata, basis=basis, color=cols,
-            title=[c.removeprefix(prefix) for c in cols],
-            ncols=min(ncols, len(cols)), color_map=cmap,
-            vmin=vmin, vmax=vmax, frameon=False,
-            colorbar_loc=("right" if show_colorbar else None),
-            show=False, return_fig=True,
+    figs = {}
+    for group, sub in _GroupSubsets(adata, groupby):
+        titles = [c.removeprefix(prefix) for c in cols]
+        if group is not None:
+            titles = [f"{group} | {t}" for t in titles]
+
+        with plt.rc_context({"figure.figsize": figsize}):  # size of each panel
+            figs[group] = sc.pl.embedding(
+                sub, basis=basis, color=cols, title=titles,
+                ncols=min(ncols, len(cols)), color_map=cmap,
+                vmin=vmin, vmax=vmax, frameon=False,
+                colorbar_loc=("right" if show_colorbar else None),
+                show=False, return_fig=True,
+            )
+
+    return figs[None] if groupby is None else figs
+
+
+# ── Metric violins per group ─────────────────────────────────────────────────
+
+def PlotMetricsViolinGrid(
+    adata: AnnData,
+    metrics: list[str],
+    x_obs: str,
+    ncols: int | None = None,
+    ylim: tuple | None = None,
+    figsize: tuple[float, float] = (10, 5),
+    rotation: float = 0,
+    jitter: float = 0.2,
+    point_size: float = 0.6,
+    spacing: float = 0.6,
+) -> None:
+    """
+    Violins of several `adata.obs` metrics (e.g. QC metrics), one panel per
+    metric, grouped by `x_obs` (e.g. clusters).
+
+    Ported from `PlotMetricsViolinGrid` in the annotation notebooks.
+
+    Parameters
+    ----------
+    adata
+        AnnData object.
+    metrics
+        `adata.obs` columns to plot, one panel each.
+    x_obs
+        `adata.obs` column used for the groups on the x axis.
+    ncols
+        Panels per row. Default: all panels in one row.
+    ylim
+        Y-axis limits applied to every panel, e.g. ``(0,)`` or ``(0, 20)``.
+    figsize
+        Figure size.
+    rotation
+        Rotation of the x tick labels, in degrees. Rotated labels are
+        aligned by their right end, so they stay under their violin.
+    jitter, point_size
+        Spread and size of the dots (one dot per cell).
+    spacing
+        Vertical space between panel rows (`hspace`, as a fraction of the
+        mean panel height). Applied after `tight_layout`.
+    """
+    n_metrics = len(metrics)
+    if ncols is None:
+        ncols = n_metrics
+    nrows = math.ceil(n_metrics / ncols)
+
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize, dpi=180)
+    axes = axes.flatten() if n_metrics > 1 else [axes]
+
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        sc.pl.violin(
+            adata,
+            keys=metric,
+            groupby=x_obs,
+            rotation=rotation,
+            multi_panel=False,
+            ax=ax,
+            show=False,
+            stripplot=True,
+            jitter=jitter,
+            size=point_size,
+            inner="box",
         )
+        ax.set_title(metric.replace("_", " "), fontsize=12, weight="bold", pad=8)
+        ax.set_xlabel("")
+        ax.set_ylabel(metric, fontsize=10)
+
+        # Rotated labels: align by the right end, so each label ends under its violin
+        if rotation:
+            plt.setp(ax.get_xticklabels(), ha="right")
+
+        # Light grid and clean style
+        ax.grid(axis="y", linestyle=":", alpha=0.3)
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+
+        if ylim is not None:
+            ax.set_ylim(ylim)
+
+    # Remove empty panels, if any
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    fig.suptitle(f"Metrics by {x_obs}", fontsize=15, weight="bold", y=0.99)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    # After tight_layout, which would otherwise reset the space between rows
+    fig.subplots_adjust(hspace=spacing)
+    plt.show()
